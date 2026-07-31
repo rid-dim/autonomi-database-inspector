@@ -60,6 +60,7 @@ contain:
 | `--json` | full report as JSON (for scripts and analysis pipelines) |
 | `--verify` | integrity check: `BLAKE3(value) == key` for every chunk |
 | `--classify` | classify each chunk (DataMap / media / text / high-entropy) and print a distribution; reads every value, so it is opt-in |
+| `--assume-encrypted-above <BYTES>` | with `--classify`, assume any chunk this large is self-encrypted and skip scanning its payload (default 3.5 MiB; `0` scans all) |
 | `--extract <XOR_HEX>` | write one chunk's raw bytes to stdout (or `--output FILE`) |
 | `--dump-all <DIR>` | write every chunk to `<DIR>/<xor-address>.bin` |
 | `--no-chunks` | suppress the per-record address list |
@@ -100,6 +101,13 @@ self-encrypted chunk for a normal upload, not file plaintext.
 
 DataMap and media matches are precise; "high-entropy" is a heuristic, since
 self-encrypted output is by design indistinguishable from random data.
+
+For speed on large stores, chunks at least `--assume-encrypted-above` bytes
+(default 3.5 MiB) are taken to be self-encrypted without scanning their
+payload — a full-size chunk is virtually always self-encrypted data, and this
+avoids faulting in gigabytes. Magic-byte detection still runs first (so a large
+unencrypted media file is recognized); set the threshold to `0` to scan every
+chunk.
 
 Exit codes: `0` ok · `1` open/read error · `2` verification failures — so the
 tool doubles as an integrity check in scripts and CI:

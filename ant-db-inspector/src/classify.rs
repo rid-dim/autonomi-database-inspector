@@ -94,41 +94,74 @@ impl ContentClass {
 pub struct Classification {
     pub class: ContentClass,
     /// Shannon entropy over the sampled bytes, bit/byte (0.0..=8.0).
-    pub entropy_bits: f64,
+    /// `None` when the payload was not scanned (a large chunk assumed
+    /// self-encrypted — see [`classify`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entropy_bits: Option<f64>,
     /// Detected format label when `class == Media`, e.g. "PNG".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<&'static str>,
     /// Number of chunk entries when `class == DataMap`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub datamap_entries: Option<u64>,
+    /// True when the class was assumed from the size alone, without reading
+    /// the payload.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub assumed: bool,
 }
 
 /// Classify a chunk value.
-pub fn classify(content: &[u8]) -> Classification {
+///
+/// `assume_encrypted_above` is a fast-path threshold: a chunk at least that
+/// large that isn't caught by the cheap magic-byte check is classified as
+/// [`ContentClass::HighEntropy`] *without* scanning its payload. On a real
+/// node this skips faulting in gigabytes of full-size chunks, which are
+/// virtually always self-encrypted data. Set it to `u64::MAX` to always
+/// scan. A rare large public DataMap (metadata for a very large file) would
+/// be assumed-encrypted rather than detected under this shortcut.
+pub fn classify(content: &[u8], assume_encrypted_above: u64) -> Classification {
     if content.is_empty() {
         return Classification {
             class: ContentClass::Empty,
-            entropy_bits: 0.0,
+            entropy_bits: None,
             format: None,
             datamap_entries: None,
+            assumed: false,
         };
     }
 
-    // Precise detectors first: a positive here is trustworthy.
-    if let Some(entries) = parse_datamap(content) {
-        return Classification {
-            class: ContentClass::DataMap,
-            entropy_bits: shannon_entropy(&content[..content.len().min(SAMPLE_LEN)]),
-            format: None,
-            datamap_entries: Some(entries),
-        };
-    }
+    // Magic bytes are cheap (first few hundred bytes, one page) and catch a
+    // large unencrypted media file uploaded as a plaintext chunk, so run this
+    // even before the size shortcut.
     if let Some(fmt) = magic_format(content) {
         return Classification {
             class: ContentClass::Media,
-            entropy_bits: shannon_entropy(&content[..content.len().min(SAMPLE_LEN)]),
+            entropy_bits: Some(shannon_entropy(&content[..content.len().min(SAMPLE_LEN)])),
             format: Some(fmt),
             datamap_entries: None,
+            assumed: false,
+        };
+    }
+
+    // Size shortcut: assume a large chunk is self-encrypted without reading it.
+    if content.len() as u64 >= assume_encrypted_above {
+        return Classification {
+            class: ContentClass::HighEntropy,
+            entropy_bits: None,
+            format: None,
+            datamap_entries: None,
+            assumed: true,
+        };
+    }
+
+    // Precise DataMap detector (small chunks only): a positive is trustworthy.
+    if let Some(entries) = parse_datamap(content) {
+        return Classification {
+            class: ContentClass::DataMap,
+            entropy_bits: Some(shannon_entropy(&content[..content.len().min(SAMPLE_LEN)])),
+            format: None,
+            datamap_entries: Some(entries),
+            assumed: false,
         };
     }
 
@@ -147,9 +180,10 @@ pub fn classify(content: &[u8]) -> Classification {
 
     Classification {
         class,
-        entropy_bits: entropy,
+        entropy_bits: Some(entropy),
         format: None,
         datamap_entries: None,
+        assumed: false,
     }
 }
 
@@ -330,11 +364,14 @@ mod tests {
         out
     }
 
+    /// Threshold that never triggers the size shortcut in these small tests.
+    const NO_SHORTCUT: u64 = u64::MAX;
+
     #[test]
     fn detects_real_datamap_root() {
         let bytes = encode_datamap(&[(0, 1000), (1, 1_048_576), (2, 512)], None);
         assert_eq!(parse_datamap(&bytes), Some(3));
-        assert_eq!(classify(&bytes).class, ContentClass::DataMap);
+        assert_eq!(classify(&bytes, NO_SHORTCUT).class, ContentClass::DataMap);
     }
 
     #[test]
@@ -376,11 +413,11 @@ mod tests {
     #[test]
     fn classifies_text_and_media() {
         let text = b"The quick brown fox jumps over the lazy dog. ".repeat(20);
-        assert_eq!(classify(&text).class, ContentClass::Text);
+        assert_eq!(classify(&text, NO_SHORTCUT).class, ContentClass::Text);
 
         let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
         png.extend_from_slice(&[0u8; 100]);
-        let c = classify(&png);
+        let c = classify(&png, NO_SHORTCUT);
         assert_eq!(c.class, ContentClass::Media);
         assert_eq!(c.format, Some("PNG"));
     }
@@ -391,6 +428,31 @@ mod tests {
         let blob: Vec<u8> = (0..8192u32)
             .map(|i| (i.wrapping_mul(2654435761) >> 15) as u8)
             .collect();
-        assert_eq!(classify(&blob).class, ContentClass::HighEntropy);
+        assert_eq!(classify(&blob, NO_SHORTCUT).class, ContentClass::HighEntropy);
+    }
+
+    #[test]
+    fn size_shortcut_assumes_encrypted_without_scan() {
+        // A large low-entropy (all-zero) chunk: a real scan would call it
+        // text/other, but above the threshold it is assumed high-entropy and
+        // not scanned (no entropy computed).
+        let big = vec![0u8; 100_000];
+        let c = classify(&big, 64 * 1024);
+        assert_eq!(c.class, ContentClass::HighEntropy);
+        assert!(c.assumed);
+        assert_eq!(c.entropy_bits, None);
+
+        // Magic bytes still win over the shortcut for large media.
+        let mut big_png = b"\x89PNG\r\n\x1a\n".to_vec();
+        big_png.resize(100_000, 0);
+        let c = classify(&big_png, 64 * 1024);
+        assert_eq!(c.class, ContentClass::Media);
+        assert!(!c.assumed);
+
+        // Below the threshold the payload is scanned as usual.
+        let small = vec![0u8; 1000];
+        let c = classify(&small, 64 * 1024);
+        assert!(!c.assumed);
+        assert!(c.entropy_bits.is_some());
     }
 }

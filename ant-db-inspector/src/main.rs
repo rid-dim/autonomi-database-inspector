@@ -88,6 +88,13 @@ struct Args {
     #[arg(long)]
     classify: bool,
 
+    /// With --classify, assume any chunk at least this many bytes is
+    /// self-encrypted and skip scanning its payload (full-size chunks are
+    /// virtually always self-encrypted data). Default 3.5 MiB. Set to 0 to
+    /// scan every chunk.
+    #[arg(long, value_name = "BYTES", default_value_t = 3_670_016)]
+    assume_encrypted_above: u64,
+
     /// Write the raw bytes of the chunk at this XOR address (64-hex) to stdout
     /// or to --output. These are the stored bytes as-is: for a normal upload
     /// that is the self-encrypted chunk, NOT the original file plaintext.
@@ -480,7 +487,14 @@ fn inspect_env(target: &EnvTarget, args: &Args) -> Result<EnvironmentReport, Str
             None
         };
 
-        let class = (args.classify && !value.is_empty()).then(|| classify::classify(value));
+        // A threshold of 0 means "scan every chunk" (never take the shortcut).
+        let assume_above = if args.assume_encrypted_above == 0 {
+            u64::MAX
+        } else {
+            args.assume_encrypted_above
+        };
+        let class =
+            (args.classify && !value.is_empty()).then(|| classify::classify(value, assume_above));
 
         entries.push(RawEntry {
             key: key.to_vec(),
@@ -968,7 +982,10 @@ fn print_environment(rep: &EnvironmentReport, args: &Args) {
                     (ContentClass::DataMap, _, Some(n)) => format!("{} ({n} chunks)", c.class.tag()),
                     _ => c.class.tag().to_string(),
                 };
-                print!("  {detail:<18} H={:.2}", c.entropy_bits);
+                match c.entropy_bits {
+                    Some(h) => print!("  {detail:<18} H={h:.2}"),
+                    None => print!("  {detail:<18} H=n/a (assumed)"),
+                }
             }
             if let Some(p) = &r.preview_hex {
                 print!("  {p}…");
@@ -1026,6 +1043,13 @@ fn print_environment(rep: &EnvironmentReport, args: &Args) {
                 "  note: high entropy is the expected shape of self-encrypted chunks but\n\
                  \x20       cannot be proven encrypted; DataMap and media matches are precise."
             );
+            if args.assume_encrypted_above > 0 {
+                println!(
+                    "  note: chunks ≥ {} were assumed high-entropy without scanning \
+                     (--assume-encrypted-above)",
+                    human_size(args.assume_encrypted_above)
+                );
+            }
         }
     }
 }

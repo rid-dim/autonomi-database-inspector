@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["ant-db-inspector", "testdb-gen"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# Exactly the heed version ant-node uses (WithAutonomi/ant-node, Cargo.toml:
+# heed = "0.22") so the LMDB format is guaranteed to match.
+heed = "0.22"
+blake3 = "1"
+hex = "0.4"
+clap = { version = "4.5", features = ["derive"] }

@@ -1,0 +1,15 @@
+[package]
+name = "testdb-gen"
+version = "0.1.0"
+description = "Erzeugt eine Test-Chunk-Datenbank im ant-node-LMDB-Format"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+heed.workspace = true
+blake3.workspace = true
+hex.workspace = true
+clap.workspace = true
+# 0.8 gepinnt: StdRng (ChaCha12) ist innerhalb dieser Version deterministisch,
+# damit --seed reproduzierbare Datenbanken liefert.
+rand = "0.8"

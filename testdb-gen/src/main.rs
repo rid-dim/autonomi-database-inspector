@@ -26,7 +26,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 
 /// One chunk entry inside a `DataMap`, matching self_encryption's `ChunkInfo`
-/// (field order and types are what bincode serializes).
+/// (`[index, dst_hash, src_hash, src_size]` on the wire).
 #[derive(Serialize)]
 struct ChunkInfo {
     index: usize,
@@ -35,9 +35,10 @@ struct ChunkInfo {
     src_size: usize,
 }
 
-/// self_encryption's versioned DataMap wire form: a leading `version: 1u8`,
-/// then the chunk list and the `child` level. `bincode::serialize` of this
-/// produces exactly what a real public DataMap chunk contains.
+/// self_encryption's versioned DataMap wire form: `[version:1, chunks, child]`.
+/// Serialized with `rmp_serde` (MessagePack) this is byte-for-byte what the
+/// autonomi client stores as a public DataMap chunk (see the client's
+/// `memory_encryption.rs::wrap_data_map`).
 #[derive(Serialize)]
 struct VersionedDataMap {
     version: u8,
@@ -79,8 +80,8 @@ struct Args {
     #[arg(long, default_value_t = 4)]
     plaintext: usize,
 
-    /// Additional public DataMap chunks (real bincode wire format) that
-    /// --classify should detect as "datamap"
+    /// Additional public DataMap chunks (real rmp-serde/MessagePack wire
+    /// format) that --classify should detect as "datamap"
     #[arg(long, default_value_t = 2)]
     datamaps: usize,
 
@@ -104,7 +105,7 @@ fn plaintext_payload(target: usize, index: usize) -> Vec<u8> {
 }
 
 /// Serialize a public DataMap referencing `refs` (real stored addresses and
-/// their sizes) in self_encryption's exact bincode wire format.
+/// their sizes) in self_encryption's exact rmp-serde/MessagePack wire format.
 fn build_datamap(refs: &[([u8; 32], usize)], rng: &mut StdRng) -> Vec<u8> {
     let chunk_identifiers = refs
         .iter()
@@ -126,7 +127,7 @@ fn build_datamap(refs: &[([u8; 32], usize)], rng: &mut StdRng) -> Vec<u8> {
         chunk_identifiers,
         child: None,
     };
-    bincode::serialize(&dm).expect("DataMap serialization")
+    rmp_serde::to_vec(&dm).expect("DataMap serialization")
 }
 
 /// Deterministic, realistic size distribution:
@@ -215,7 +216,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         total_bytes += content.len() as u64;
     }
 
-    // ── public DataMap chunks (real bincode wire format → "datamap") ─────
+    // ── public DataMap chunks (real MessagePack wire format → "datamap") ─
     let datamaps = if data_refs.is_empty() { 0 } else { args.datamaps };
     for i in 0..datamaps {
         // Reference a growing slice of real data chunks (≥3, like a root map).

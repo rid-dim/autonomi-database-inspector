@@ -63,6 +63,7 @@ contain:
 | `--assume-encrypted-above <BYTES>` | with `--classify`, assume any chunk this large is self-encrypted and skip scanning its payload (default 3.5 MiB; `0` scans all) |
 | `--extract <XOR_HEX>` | write one chunk's raw bytes to stdout (or `--output FILE`) |
 | `--dump-all <DIR>` | write every chunk to `<DIR>/<xor-address>.bin` |
+| `--export-textfiles <DIR>` | write only the plaintext-text chunks to `<DIR>/<xor-address>.txt` (the unencrypted, human-readable content on a node) |
 | `--no-chunks` | suppress the per-record address list |
 | `--limit N` | cap the record list at N entries per database (0 = all) |
 | `--sort addr\|size` | list order: address ascending / size descending |
@@ -90,9 +91,11 @@ self-encrypted chunk for a normal upload, not file plaintext.
 `--classify` guesses what each chunk is, purely from its bytes:
 
 - **datamap** — a public DataMap (self-encryption's retrieval metadata) is stored
-  *unencrypted* and has a precise bincode wire format, so it is detected exactly
-  (version byte, contiguous indices, bounded `src_size`, exact length). This is
-  how you spot public data and count it as a share of the store.
+  *unencrypted*. The autonomi client serializes it with `rmp-serde` (MessagePack);
+  the inspector deserializes candidate chunks back into mirror structs (current
+  `[version, chunks, child]` form and the legacy `DataMapLevel` form) and
+  validates them (contiguous indices, bounded `src_size`). This is how you spot
+  public data and count it as a share of the store.
 - **media** — recognized by magic bytes (PNG, PDF, ZIP, gzip, …): unencrypted.
 - **text** — mostly printable, low entropy: unencrypted.
 - **high-entropy (`enc?`)** — entropy near 8 bit/byte: the expected shape of a
@@ -127,9 +130,10 @@ edge-case chunk. The paid list contains all stored chunk addresses plus a few
 paid-but-not-yet-uploaded keys.
 
 To exercise `--classify`, the store also contains a few **plaintext** chunks and
-real **public DataMap** chunks. The DataMaps are serialized with the same
-`bincode` version `self_encryption` uses, so they are byte-for-byte the real
-wire format — which also cross-checks the inspector's DataMap parser.
+real **public DataMap** chunks. The DataMaps use the same `rmp-serde`
+(MessagePack) wire format the autonomi client produces; the inspector's parser
+is verified against ground-truth bytes emitted by the real `self_encryption`
+crate (see the `detects_real_datamap_*` tests).
 
 ```console
 $ testdb-gen --out testdata --count 100 --plaintext 4 --datamaps 2 --extra-paid 5 --seed 42

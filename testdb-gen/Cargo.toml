@@ -14,6 +14,6 @@ clap.workspace = true
 # damit --seed reproduzierbare Datenbanken liefert.
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
-# Exakt die bincode-Version, die self_encryption verwendet (1.3.3), damit die
-# generierten DataMap-Chunks bit-für-bit dem echten Wire-Format entsprechen.
-bincode = "1.3.3"
+# Autonomi serializes public DataMaps with rmp-serde (MessagePack); we use the
+# same crate so the generated DataMap chunks match the real wire format.
+rmp-serde = "1"

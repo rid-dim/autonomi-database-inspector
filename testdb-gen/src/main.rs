@@ -22,7 +22,28 @@ use heed::types::Bytes;
 use heed::{Database, Env, EnvOpenOptions};
 use rand::rngs::StdRng;
 use rand::{Rng, RngCore, SeedableRng};
+use serde::Serialize;
 use std::path::{Path, PathBuf};
+
+/// One chunk entry inside a `DataMap`, matching self_encryption's `ChunkInfo`
+/// (field order and types are what bincode serializes).
+#[derive(Serialize)]
+struct ChunkInfo {
+    index: usize,
+    dst_hash: [u8; 32],
+    src_hash: [u8; 32],
+    src_size: usize,
+}
+
+/// self_encryption's versioned DataMap wire form: a leading `version: 1u8`,
+/// then the chunk list and the `child` level. `bincode::serialize` of this
+/// produces exactly what a real public DataMap chunk contains.
+#[derive(Serialize)]
+struct VersionedDataMap {
+    version: u8,
+    chunk_identifiers: Vec<ChunkInfo>,
+    child: Option<usize>,
+}
 
 /// Maximum chunk size on the Autonomi network (ant-protocol: `MAX_CHUNK_SIZE`).
 const MAX_CHUNK_SIZE: usize = 4 * 1024 * 1024;
@@ -53,9 +74,59 @@ struct Args {
     #[arg(long, default_value_t = 5)]
     extra_paid: usize,
 
+    /// Additional plaintext (readable text) chunks — unencrypted content that
+    /// the inspector's --classify should flag as "text"
+    #[arg(long, default_value_t = 4)]
+    plaintext: usize,
+
+    /// Additional public DataMap chunks (real bincode wire format) that
+    /// --classify should detect as "datamap"
+    #[arg(long, default_value_t = 2)]
+    datamaps: usize,
+
     /// RNG seed (same seed → identical databases)
     #[arg(short, long, default_value_t = 42)]
     seed: u64,
+}
+
+/// A short, readable, low-entropy text payload of roughly `target` bytes.
+fn plaintext_payload(target: usize, index: usize) -> Vec<u8> {
+    let sentence = format!(
+        "Chunk {index}: the quick brown fox jumps over the lazy dog. \
+         Autonomi stores content-addressed chunks; BLAKE3(content) is the address. "
+    );
+    let mut out = String::new();
+    while out.len() < target {
+        out.push_str(&sentence);
+    }
+    out.truncate(target.max(sentence.len()));
+    out.into_bytes()
+}
+
+/// Serialize a public DataMap referencing `refs` (real stored addresses and
+/// their sizes) in self_encryption's exact bincode wire format.
+fn build_datamap(refs: &[([u8; 32], usize)], rng: &mut StdRng) -> Vec<u8> {
+    let chunk_identifiers = refs
+        .iter()
+        .enumerate()
+        .map(|(index, (dst_hash, size))| {
+            let mut src_hash = [0u8; 32];
+            rng.fill_bytes(&mut src_hash);
+            ChunkInfo {
+                index,
+                dst_hash: *dst_hash,
+                src_hash,
+                // Pre-encryption source size, bounded to a realistic ≤ 1 MiB.
+                src_size: (*size).clamp(1, 1024 * 1024),
+            }
+        })
+        .collect();
+    let dm = VersionedDataMap {
+        version: 1,
+        chunk_identifiers,
+        child: None,
+    };
+    bincode::serialize(&dm).expect("DataMap serialization")
 }
 
 /// Deterministic, realistic size distribution:
@@ -111,8 +182,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut wtxn = chunks_env.write_txn()?;
     let mut addresses: Vec<[u8; 32]> = Vec::with_capacity(args.count);
+    // (address, size) of the random data chunks — referenced by the DataMaps.
+    let mut data_refs: Vec<([u8; 32], usize)> = Vec::with_capacity(args.count);
     let mut total_bytes = 0u64;
 
+    // ── random "data" chunks (stand in for self-encrypted, high-entropy) ─
     for i in 0..args.count {
         let size = chunk_size(i, args.count, &mut rng);
         let mut content = vec![0u8; size];
@@ -122,6 +196,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let address: [u8; 32] = *blake3::hash(&content).as_bytes();
         chunks_db.put(&mut wtxn, &address, &content)?;
         addresses.push(address);
+        data_refs.push((address, size));
         total_bytes += size as u64;
 
         if i < 3 || i == args.count - 1 {
@@ -130,7 +205,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  ...");
         }
     }
+
+    // ── plaintext chunks (unencrypted, low entropy → classified "text") ──
+    for i in 0..args.plaintext {
+        let content = plaintext_payload(rng.gen_range(200..4000), i);
+        let address: [u8; 32] = *blake3::hash(&content).as_bytes();
+        chunks_db.put(&mut wtxn, &address, &content)?;
+        addresses.push(address);
+        total_bytes += content.len() as u64;
+    }
+
+    // ── public DataMap chunks (real bincode wire format → "datamap") ─────
+    let datamaps = if data_refs.is_empty() { 0 } else { args.datamaps };
+    for i in 0..datamaps {
+        // Reference a growing slice of real data chunks (≥3, like a root map).
+        let n = (3 + i * 2).clamp(1, data_refs.len());
+        let content = build_datamap(&data_refs[..n], &mut rng);
+        let address: [u8; 32] = *blake3::hash(&content).as_bytes();
+        chunks_db.put(&mut wtxn, &address, &content)?;
+        addresses.push(address);
+        total_bytes += content.len() as u64;
+    }
     wtxn.commit()?;
+
+    let total_chunks = args.count + args.plaintext + datamaps;
 
     // ── paid list ───────────────────────────────────────────────────────
     // A real node tracks the keys it considers paid-authorized: the stored
@@ -165,16 +263,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         chunks_dir.display()
     );
     println!(
+        "  {} data + {} plaintext + {} datamap",
+        args.count, args.plaintext, datamaps
+    );
+    println!(
         "Created {} paid-list keys ({} stored + {} paid-only) in {}",
         paid_entries,
         addresses.len(),
         args.extra_paid,
         paid_dir.display()
     );
-    assert_eq!(chunk_entries, args.count, "chunk entry count mismatch after commit");
+    assert_eq!(chunk_entries, total_chunks, "chunk entry count mismatch after commit");
     assert_eq!(
         paid_entries,
-        args.count + args.extra_paid,
+        total_chunks + args.extra_paid,
         "paid-list entry count mismatch after commit"
     );
 

@@ -768,11 +768,13 @@ dependencies = [
 name = "testdb-gen"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "blake3",
  "clap",
  "heed",
  "hex",
  "rand",
+ "serde",
 ]
 
 [[package]]

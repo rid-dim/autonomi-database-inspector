@@ -13,3 +13,7 @@ clap.workspace = true
 # 0.8 gepinnt: StdRng (ChaCha12) ist innerhalb dieser Version deterministisch,
 # damit --seed reproduzierbare Datenbanken liefert.
 rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+# Exakt die bincode-Version, die self_encryption verwendet (1.3.3), damit die
+# generierten DataMap-Chunks bit-für-bit dem echten Wire-Format entsprechen.
+bincode = "1.3.3"

@@ -130,7 +130,7 @@ $ testdb-gen --out testdata --count 100 --plaintext 4 --datamaps 2 --extra-paid 
 ## Sample output
 
 ```text
-$ ant-db-inspector testdata/chunks.mdb --classify --verify --limit 5
+$ ant-db-inspector testdata/chunks.mdb --verify --limit 5
 
 Database: chunks.mdb — chunk store
 ════════════════════════════════════════════════════════════════════════
@@ -175,12 +175,12 @@ Records: 106
 Content verification (BLAKE3(value) == key)
   checked: 106   ok: 106   failed: 0   skipped: 0 empty-value, 0 non-XorName-key
 
-Records (XOR address · size · class)
-  00ac779cc21688baf8f956467b22d603aaf8bf718f2375715824935ec701fdcc     135,452 B  enc?               H=8.00
-  0146a5ba1b5d23442504f513f89c1ab9925164c3be72984cd075bc1ab81e1610     101,754 B  enc?               H=8.00
-  01bd17483321b39fbf4b044f8edd3d2ab333fa4af63bdb0554e3816711c7dc2b      88,140 B  enc?               H=8.00
-  0307b275fe3d21f0313d9229be1c05b4704e9437efdcecd23a76857893337b4f       5,687 B  enc?               H=7.97
-  03f539842a2ea96dd0ec481dc8034da2d71948a3f3d344463119fe5d12de76ab       1,077 B  bin                H=7.83
+Records (XOR address · size)
+  00ac779cc21688baf8f956467b22d603aaf8bf718f2375715824935ec701fdcc     135,452 B
+  0146a5ba1b5d23442504f513f89c1ab9925164c3be72984cd075bc1ab81e1610     101,754 B
+  01bd17483321b39fbf4b044f8edd3d2ab333fa4af63bdb0554e3816711c7dc2b      88,140 B
+  0307b275fe3d21f0313d9229be1c05b4704e9437efdcecd23a76857893337b4f       5,687 B
+  03f539842a2ea96dd0ec481dc8034da2d71948a3f3d344463119fe5d12de76ab       1,077 B
   … list truncated at 5 of 106 records (--limit)
 
 Statistics (value sizes)
@@ -205,14 +205,6 @@ Statistics (value sizes)
          2–3 MiB │                                         0
          3–4 MiB │███                                      1
          > 4 MiB │                                         0
-
-Content classification (% of stored chunks)
-          enc? │██████████████████████████████  80.2%  85  — high entropy — likely self-encrypted or compressed
-           bin │█████                           14.2%  15  — structured binary, unrecognized
-          text │█                                3.8%  4  — mostly printable text — unencrypted
-       datamap │█                                1.9%  2  — public DataMap (unencrypted retrieval metadata)
-  note: high entropy is the expected shape of self-encrypted chunks but
-        cannot be proven encrypted; DataMap and media matches are precise.
 ```
 
 Extracting the raw bytes of one chunk (self-encrypted for a normal upload):

@@ -13,16 +13,20 @@
 //! files contain: environment metadata, raw LMDB meta pages (both
 //! generations), freelist and space accounting, tables with B-tree stats,
 //! key/value schema with a format check, record counts, all XOR addresses
-//! with sizes, size statistics, and optionally a content-integrity check
-//! (BLAKE3(value) == key) and a hex preview of stored values.
+//! with sizes, size statistics, per-chunk content classification (DataMap /
+//! media / text / high-entropy), and optionally a content-integrity check
+//! (BLAKE3(value) == key), a hex preview, or a raw extract of stored bytes.
 
+mod classify;
 mod meta;
 
+use classify::{ContentClass, Classification};
 use clap::{Parser, ValueEnum};
 use heed::types::Bytes;
 use heed::{Database, Env, EnvFlags, EnvOpenOptions, RoTxn};
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Cap for named-database enumeration. ant-node only uses the unnamed
@@ -78,6 +82,26 @@ struct Args {
     #[arg(long, default_value_t = 0, value_name = "N")]
     preview: usize,
 
+    /// Classify each chunk by content (DataMap / media / text / high-entropy)
+    /// and print a distribution with the share of public DataMaps. Reads every
+    /// value, so it is opt-in; off by default.
+    #[arg(long)]
+    classify: bool,
+
+    /// Write the raw bytes of the chunk at this XOR address (64-hex) to stdout
+    /// or to --output. These are the stored bytes as-is: for a normal upload
+    /// that is the self-encrypted chunk, NOT the original file plaintext.
+    #[arg(long, value_name = "XOR_HEX")]
+    extract: Option<String>,
+
+    /// Destination file for --extract (default: stdout)
+    #[arg(short, long, value_name = "FILE")]
+    output: Option<PathBuf>,
+
+    /// Write every chunk's raw bytes to <DIR>/<xor-address>.bin
+    #[arg(long, value_name = "DIR")]
+    dump_all: Option<PathBuf>,
+
     /// Open without the LMDB lock file (for snapshots on read-only media;
     /// never use while a node is writing to the database)
     #[arg(long)]
@@ -110,7 +134,17 @@ struct EnvironmentReport {
     records: Vec<RecordReport>,
     records_truncated_at: Option<usize>,
     statistics: Option<StatsReport>,
+    content_distribution: Option<Vec<ClassBucket>>,
     verification: Option<VerifyReport>,
+}
+
+/// One row of the content-classification distribution.
+#[derive(Serialize)]
+struct ClassBucket {
+    class: ContentClass,
+    description: String,
+    count: u64,
+    percent: f64,
 }
 
 #[derive(Serialize)]
@@ -190,6 +224,8 @@ struct SchemaReport {
 struct RecordReport {
     xor_address: String,
     size_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    classification: Option<Classification>,
     #[serde(skip_serializing_if = "Option::is_none")]
     preview_hex: Option<String>,
 }
@@ -367,6 +403,7 @@ struct RawEntry {
     key: Vec<u8>,
     value_len: u64,
     preview: Option<Vec<u8>>,
+    class: Option<Classification>,
     verified: Option<Result<(), [u8; 32]>>,
 }
 
@@ -443,11 +480,14 @@ fn inspect_env(target: &EnvTarget, args: &Args) -> Result<EnvironmentReport, Str
             None
         };
 
+        let class = (args.classify && !value.is_empty()).then(|| classify::classify(value));
+
         entries.push(RawEntry {
             key: key.to_vec(),
             value_len: value.len() as u64,
             preview: (args.preview > 0 && !value.is_empty())
                 .then(|| value[..value.len().min(args.preview)].to_vec()),
+            class,
             verified,
         });
     }
@@ -601,6 +641,33 @@ fn inspect_env(target: &EnvTarget, args: &Args) -> Result<EnvironmentReport, Str
         }
     });
 
+    // ── content distribution ────────────────────────────────────────────
+    // Aggregate the per-chunk classification. Empty values (paid list) are
+    // excluded so the percentages describe actual stored content.
+    let content_distribution = args.classify.then(|| {
+        let mut counts: BTreeMap<&'static str, (ContentClass, u64)> = BTreeMap::new();
+        let mut total = 0u64;
+        for e in &entries {
+            if let Some(c) = &e.class {
+                if c.class != ContentClass::Empty {
+                    counts.entry(c.class.key()).or_insert((c.class, 0)).1 += 1;
+                    total += 1;
+                }
+            }
+        }
+        let mut buckets: Vec<ClassBucket> = counts
+            .values()
+            .map(|(class, count)| ClassBucket {
+                class: *class,
+                description: class.description().to_string(),
+                count: *count,
+                percent: if total > 0 { *count as f64 / total as f64 * 100.0 } else { 0.0 },
+            })
+            .collect();
+        buckets.sort_by(|a, b| b.count.cmp(&a.count).then(a.class.key().cmp(b.class.key())));
+        buckets
+    });
+
     // ── record list ─────────────────────────────────────────────────────
     match args.sort {
         SortOrder::Addr => entries.sort_by(|a, b| a.key.cmp(&b.key)),
@@ -617,6 +684,7 @@ fn inspect_env(target: &EnvTarget, args: &Args) -> Result<EnvironmentReport, Str
         .map(|e| RecordReport {
             xor_address: hex::encode(&e.key),
             size_bytes: e.value_len,
+            classification: e.class.clone(),
             preview_hex: e.preview.as_deref().map(hex::encode),
         })
         .collect();
@@ -631,6 +699,7 @@ fn inspect_env(target: &EnvTarget, args: &Args) -> Result<EnvironmentReport, Str
         records,
         records_truncated_at,
         statistics,
+        content_distribution,
         verification,
     })
 }
@@ -889,9 +958,18 @@ fn print_environment(rep: &EnvironmentReport, args: &Args) {
     }
 
     if !args.no_chunks && !rep.records.is_empty() {
-        println!("\nRecords (XOR address · size)");
+        let show_class = rep.records.iter().any(|r| r.classification.is_some());
+        println!("\nRecords (XOR address · size{})", if show_class { " · class" } else { "" });
         for r in &rep.records {
             print!("  {}  {:>12}", r.xor_address, format!("{} B", thousands(r.size_bytes)));
+            if let Some(c) = &r.classification {
+                let detail = match (c.class, c.format, c.datamap_entries) {
+                    (ContentClass::Media, Some(fmt), _) => format!("{} ({fmt})", c.class.tag()),
+                    (ContentClass::DataMap, _, Some(n)) => format!("{} ({n} chunks)", c.class.tag()),
+                    _ => c.class.tag().to_string(),
+                };
+                print!("  {detail:<18} H={:.2}", c.entropy_bits);
+            }
             if let Some(p) = &r.preview_hex {
                 print!("  {p}…");
             }
@@ -928,6 +1006,107 @@ fn print_environment(rep: &EnvironmentReport, args: &Args) {
             );
         }
     }
+
+    if let Some(dist) = &rep.content_distribution {
+        if !dist.is_empty() {
+            println!("\nContent classification (% of stored chunks)");
+            let max_count = dist.iter().map(|b| b.count).max().unwrap_or(1).max(1);
+            for b in dist {
+                let bar_len = ((b.count as f64 / max_count as f64) * 30.0).round() as usize;
+                println!(
+                    "  {:>12} │{:<30} {:>5.1}%  {}  — {}",
+                    b.class.tag(),
+                    "█".repeat(bar_len),
+                    b.percent,
+                    thousands(b.count),
+                    b.description
+                );
+            }
+            println!(
+                "  note: high entropy is the expected shape of self-encrypted chunks but\n\
+                 \x20       cannot be proven encrypted; DataMap and media matches are precise."
+            );
+        }
+    }
+}
+
+/// Parse a 64-hex XOR address into 32 bytes.
+fn parse_xor_hex(s: &str) -> Result<[u8; 32], String> {
+    let bytes = hex::decode(s.trim()).map_err(|e| format!("invalid hex address: {e}"))?;
+    bytes
+        .try_into()
+        .map_err(|v: Vec<u8>| format!("address must be 32 bytes (64 hex chars), got {}", v.len()))
+}
+
+/// `--extract`: write the raw bytes of one chunk to stdout or a file.
+///
+/// The bytes are emitted exactly as stored. For a normal upload that is the
+/// self-encrypted chunk, not the original file plaintext (see the module docs
+/// and `classify.rs`).
+fn run_extract(targets: &[EnvTarget], addr_hex: &str, output: Option<&Path>, no_lock: bool) -> Result<(), String> {
+    let address = parse_xor_hex(addr_hex)?;
+    for target in targets {
+        let env = open_env(target, no_lock)?;
+        let rtxn = env.read_txn().map_err(|e| format!("cannot open read txn: {e}"))?;
+        let db: Database<Bytes, Bytes> = env
+            .open_database(&rtxn, None)
+            .map_err(|e| format!("cannot open main database: {e}"))?
+            .ok_or("main database not found")?;
+        if let Some(value) = db
+            .get(&rtxn, &address[..])
+            .map_err(|e| format!("read failed: {e}"))?
+        {
+            match output {
+                Some(path) => {
+                    std::fs::write(path, value)
+                        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+                    eprintln!("wrote {} bytes to {}", value.len(), path.display());
+                }
+                None => {
+                    std::io::stdout()
+                        .write_all(value)
+                        .map_err(|e| format!("cannot write to stdout: {e}"))?;
+                }
+            }
+            return Ok(());
+        }
+    }
+    Err(format!("chunk {addr_hex} not found in any database"))
+}
+
+/// `--dump-all`: write every non-empty chunk to `<dir>/<xor-address>.bin`.
+fn run_dump_all(targets: &[EnvTarget], dir: &Path, no_lock: bool) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let mut written = 0u64;
+    let mut total_bytes = 0u64;
+    for target in targets {
+        let env = open_env(target, no_lock)?;
+        let rtxn = env.read_txn().map_err(|e| format!("cannot open read txn: {e}"))?;
+        let db: Database<Bytes, Bytes> = env
+            .open_database(&rtxn, None)
+            .map_err(|e| format!("cannot open main database: {e}"))?
+            .ok_or("main database not found")?;
+        let iter = db.iter(&rtxn).map_err(|e| format!("cannot iterate: {e}"))?;
+        for item in iter {
+            let (key, value) = item.map_err(|e| format!("read error: {e}"))?;
+            // Skip empty values (paid-list membership) and sub-database records.
+            if value.is_empty() || key.len() != XORNAME_LEN {
+                continue;
+            }
+            let path = dir.join(format!("{}.bin", hex::encode(key)));
+            std::fs::write(&path, value)
+                .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+            written += 1;
+            total_bytes += value.len() as u64;
+        }
+    }
+    eprintln!(
+        "dumped {} chunks ({}) to {}",
+        thousands(written),
+        human_size(total_bytes),
+        dir.display()
+    );
+    Ok(())
 }
 
 fn main() {
@@ -940,6 +1119,22 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    // Extraction modes bypass the report entirely.
+    if let Some(addr) = &args.extract {
+        if let Err(e) = run_extract(&targets, addr, args.output.as_deref(), args.no_lock) {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if let Some(dir) = &args.dump_all {
+        if let Err(e) = run_dump_all(&targets, dir, args.no_lock) {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     let mut environments = Vec::new();
     let mut had_error = false;
@@ -1045,6 +1240,7 @@ mod tests {
             key: vec![0xAA; key_len],
             value_len,
             preview: None,
+            class: None,
             verified: None,
         }
     }

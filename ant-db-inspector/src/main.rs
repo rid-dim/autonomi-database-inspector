@@ -109,6 +109,12 @@ struct Args {
     #[arg(long, value_name = "DIR")]
     dump_all: Option<PathBuf>,
 
+    /// Classify chunks and write only those that look like plaintext text to
+    /// <DIR>/<xor-address>.txt — the unencrypted content on a node. Chunks at
+    /// or above --assume-encrypted-above are skipped without scanning.
+    #[arg(long, value_name = "DIR")]
+    export_textfiles: Option<PathBuf>,
+
     /// Open without the LMDB lock file (for snapshots on read-only media;
     /// never use while a node is writing to the database)
     #[arg(long)]
@@ -487,12 +493,7 @@ fn inspect_env(target: &EnvTarget, args: &Args) -> Result<EnvironmentReport, Str
             None
         };
 
-        // A threshold of 0 means "scan every chunk" (never take the shortcut).
-        let assume_above = if args.assume_encrypted_above == 0 {
-            u64::MAX
-        } else {
-            args.assume_encrypted_above
-        };
+        let assume_above = assume_encrypted_threshold(args.assume_encrypted_above);
         let class =
             (args.classify && !value.is_empty()).then(|| classify::classify(value, assume_above));
 
@@ -1054,6 +1055,16 @@ fn print_environment(rep: &EnvironmentReport, args: &Args) {
     }
 }
 
+/// Resolve the `--assume-encrypted-above` argument: 0 means "scan every chunk"
+/// (never take the size shortcut), so map it to `u64::MAX`.
+fn assume_encrypted_threshold(arg: u64) -> u64 {
+    if arg == 0 {
+        u64::MAX
+    } else {
+        arg
+    }
+}
+
 /// Parse a 64-hex XOR address into 32 bytes.
 fn parse_xor_hex(s: &str) -> Result<[u8; 32], String> {
     let bytes = hex::decode(s.trim()).map_err(|e| format!("invalid hex address: {e}"))?;
@@ -1133,6 +1144,55 @@ fn run_dump_all(targets: &[EnvTarget], dir: &Path, no_lock: bool) -> Result<(), 
     Ok(())
 }
 
+/// `--export-textfiles`: classify each chunk and write those that look like
+/// plaintext text to `<dir>/<xor-address>.txt`.
+///
+/// This surfaces the unencrypted, human-readable content a node happens to
+/// hold. Chunks at or above `assume_encrypted_above` are skipped without
+/// scanning (a full-size chunk is virtually always self-encrypted).
+fn run_export_textfiles(
+    targets: &[EnvTarget],
+    dir: &Path,
+    assume_above: u64,
+    no_lock: bool,
+) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let mut written = 0u64;
+    let mut scanned = 0u64;
+    let mut total_bytes = 0u64;
+    for target in targets {
+        let env = open_env(target, no_lock)?;
+        let rtxn = env.read_txn().map_err(|e| format!("cannot open read txn: {e}"))?;
+        let db: Database<Bytes, Bytes> = env
+            .open_database(&rtxn, None)
+            .map_err(|e| format!("cannot open main database: {e}"))?
+            .ok_or("main database not found")?;
+        let iter = db.iter(&rtxn).map_err(|e| format!("cannot iterate: {e}"))?;
+        for item in iter {
+            let (key, value) = item.map_err(|e| format!("read error: {e}"))?;
+            if value.is_empty() || key.len() != XORNAME_LEN {
+                continue;
+            }
+            scanned += 1;
+            if classify::classify(value, assume_above).class == ContentClass::Text {
+                let path = dir.join(format!("{}.txt", hex::encode(key)));
+                std::fs::write(&path, value)
+                    .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+                written += 1;
+                total_bytes += value.len() as u64;
+            }
+        }
+    }
+    eprintln!(
+        "exported {} text chunks ({}) of {} scanned to {}",
+        thousands(written),
+        human_size(total_bytes),
+        thousands(scanned),
+        dir.display()
+    );
+    Ok(())
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -1154,6 +1214,14 @@ fn main() {
     }
     if let Some(dir) = &args.dump_all {
         if let Err(e) = run_dump_all(&targets, dir, args.no_lock) {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if let Some(dir) = &args.export_textfiles {
+        let assume_above = assume_encrypted_threshold(args.assume_encrypted_above);
+        if let Err(e) = run_export_textfiles(&targets, dir, assume_above, args.no_lock) {
             eprintln!("error: {e}");
             std::process::exit(1);
         }

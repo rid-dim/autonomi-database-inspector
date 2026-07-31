@@ -256,149 +256,153 @@ fn magic_format(data: &[u8]) -> Option<&'static str> {
     None
 }
 
-/// Try to parse `content` as a bincode-serialized self-encryption `DataMap`
-/// (v1 versioned format) and return the number of chunk entries on success.
-///
-/// Layout (bincode 1.x default: fixint, little-endian):
-///
-/// ```text
-/// version : u8 = 0x01
-/// len     : u64                       (number of ChunkInfo entries, N)
-/// N × ChunkInfo {
-///     index    : u64
-///     dst_hash : [u8; 32]
-///     src_hash : [u8; 32]
-///     src_size : u64
-/// }                                   (80 bytes each)
-/// child   : Option<usize>             (0x00 | 0x01 + u64)
-/// ```
-///
-/// Validation is strict — the whole-chunk length must match exactly, the
-/// version byte must be 1, the embedded length must equal the derived N,
-/// indices must run 0..N, and every `src_size` must be in `1..=MAX_CHUNK_SIZE`.
-/// Random or self-encrypted bytes effectively never satisfy all of these at
-/// once, so a positive result is trustworthy. Note this only detects DataMaps
-/// stored *directly* (the common public case); a re-encrypted / shrunk
-/// DataMap is indistinguishable from a normal chunk and will not match.
-pub fn parse_datamap(content: &[u8]) -> Option<u64> {
-    const HEADER: usize = 1 + 8; // version + vec length
-    const ENTRY: usize = 8 + 32 + 32 + 8; // 80
-    let len = content.len();
-    if len < HEADER + 1 {
-        return None;
-    }
+/// Largest chunk we attempt to parse as a DataMap. Real root DataMaps are a
+/// few hundred bytes to a few KiB (self-encryption shrinks larger ones), so a
+/// generous cap keeps the rmp-serde attempt off multi-megabyte data chunks.
+const DATAMAP_MAX_TRY: usize = 512 * 1024;
 
-    // Derive N from the total length, for child = None (1 byte) or Some (9).
-    let body = len - HEADER;
-    let (n, child_some) = if body >= 1 && (body - 1).is_multiple_of(ENTRY) {
-        ((body - 1) / ENTRY, false)
-    } else if body >= 9 && (body - 9).is_multiple_of(ENTRY) {
-        ((body - 9) / ENTRY, true)
-    } else {
-        return None;
-    };
-    if n == 0 {
-        return None;
-    }
-
-    if content[0] != 0x01 {
-        return None;
-    }
-    let vec_len = read_u64(content, 1)?;
-    if vec_len != n as u64 {
-        return None;
-    }
-
-    for i in 0..n {
-        let base = HEADER + i * ENTRY;
-        let index = read_u64(content, base)?;
-        if index != i as u64 {
-            return None;
-        }
-        let src_size = read_u64(content, base + 8 + 32 + 32)?;
-        if src_size == 0 || src_size > MAX_CHUNK_SIZE {
-            return None;
-        }
-    }
-
-    // Validate the child tag against the length we assumed.
-    let child_tag = content[HEADER + n * ENTRY];
-    match (child_tag, child_some) {
-        (0, false) => {}
-        (1, true) => {}
-        _ => return None,
-    }
-
-    Some(n as u64)
+/// One chunk entry as it appears on the wire inside a DataMap: a 4-element
+/// MessagePack array `[index, dst_hash, src_hash, src_size]`. The 32-byte
+/// hashes are encoded as arrays of 32 integers (serde `[u8; 32]`).
+#[derive(serde::Deserialize)]
+struct WireChunkInfo {
+    index: u64,
+    #[allow(dead_code)]
+    dst_hash: [u8; 32],
+    #[allow(dead_code)]
+    src_hash: [u8; 32],
+    src_size: u64,
 }
 
-fn read_u64(data: &[u8], off: usize) -> Option<u64> {
-    data.get(off..off + 8)
-        .map(|s| u64::from_le_bytes(s.try_into().expect("checked length")))
+/// Current self-encryption DataMap wire form (autonomi `wrap_data_map`):
+/// `rmp_serde` of `[version, chunk_identifiers, child]`.
+#[derive(serde::Deserialize)]
+struct WireDataMapNew {
+    version: u8,
+    chunk_identifiers: Vec<WireChunkInfo>,
+    #[allow(dead_code)]
+    child: Option<u64>,
+}
+
+/// Legacy wire form: `rmp_serde` of the `DataMapLevel` enum wrapping the old
+/// self-encryption DataMap, which serializes as a bare list of chunk infos.
+#[derive(serde::Deserialize)]
+enum WireDataMapLevel {
+    First(Vec<WireChunkInfo>),
+    Additional(Vec<WireChunkInfo>),
+}
+
+/// Try to parse `content` as a public self-encryption DataMap chunk and return
+/// the number of chunk entries on success.
+///
+/// Autonomi stores a public DataMap as the `rmp_serde` (MessagePack)
+/// serialization of the self-encryption DataMap (see the autonomi client's
+/// `memory_encryption.rs::wrap_data_map`). Two forms occur in the wild:
+///
+/// - **current**: `[version:1, chunk_identifiers, child]`
+/// - **legacy**: the `DataMapLevel::First/Additional` enum → a MessagePack map
+///   `{"First": [chunk_infos]}`
+///
+/// Both are deserialized with `rmp-serde` into mirror structs, then validated:
+/// non-empty, contiguous indices `0..N`, and every `src_size` in
+/// `1..=MAX_CHUNK_SIZE`. Random or self-encrypted bytes essentially never
+/// deserialize into this nested shape *and* pass the checks, so a positive
+/// result is trustworthy.
+pub fn parse_datamap(content: &[u8]) -> Option<u64> {
+    if content.len() < 4 || content.len() > DATAMAP_MAX_TRY {
+        return None;
+    }
+
+    // Current format: top-level array [version, chunks, child].
+    if let Ok(dm) = rmp_serde::from_slice::<WireDataMapNew>(content) {
+        if dm.version == 1 && plausible_chunks(&dm.chunk_identifiers) {
+            return Some(dm.chunk_identifiers.len() as u64);
+        }
+    }
+
+    // Legacy format: DataMapLevel enum map {"First"|"Additional": [chunks]}.
+    if let Ok(level) = rmp_serde::from_slice::<WireDataMapLevel>(content) {
+        let chunks = match &level {
+            WireDataMapLevel::First(c) | WireDataMapLevel::Additional(c) => c,
+        };
+        if plausible_chunks(chunks) {
+            return Some(chunks.len() as u64);
+        }
+    }
+
+    None
+}
+
+/// A chunk-info list is a plausible DataMap: non-empty, indices run `0..N`,
+/// and every `src_size` is a sane chunk size.
+fn plausible_chunks(chunks: &[WireChunkInfo]) -> bool {
+    !chunks.is_empty()
+        && chunks
+            .iter()
+            .enumerate()
+            .all(|(i, c)| c.index == i as u64 && c.src_size >= 1 && c.src_size <= MAX_CHUNK_SIZE)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Serialize a DataMap exactly like bincode 1.x would, to prove the parser
-    /// accepts the real format.
-    fn encode_datamap(indices_sizes: &[(u64, u64)], child: Option<u64>) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.push(0x01); // version
-        out.extend_from_slice(&(indices_sizes.len() as u64).to_le_bytes());
-        for (i, (index, src_size)) in indices_sizes.iter().enumerate() {
-            assert_eq!(*index, i as u64);
-            out.extend_from_slice(&index.to_le_bytes());
-            out.extend_from_slice(&[0xAB; 32]); // dst_hash
-            out.extend_from_slice(&[0xCD; 32]); // src_hash
-            out.extend_from_slice(&src_size.to_le_bytes());
-        }
-        match child {
-            None => out.push(0x00),
-            Some(v) => {
-                out.push(0x01);
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        out
-    }
+    /// Real wire bytes of a public DataMap for a 3-chunk file, produced by the
+    /// actual `self_encryption` 0.34.3 crate serialized with `rmp_serde`
+    /// exactly as the autonomi client does (current format). Ground truth —
+    /// not generated by this codebase, so the test is not circular.
+    const REAL_DATAMAP_NEW: &str = "9301939400dc002015cc95cc9accb9ccf655cc934d66ccf6cc912eccb15e15\
+3847ccbcccd4cca90bcc94cce549520dcc8e51cce8cccdccf2ccc8dc0020372077ccac20022ccc94ccbcccce5d0dcce3cc\
+c8ccdd6149cce1ccd5ccc5ccdccc93cc934fccac2725671365673bcd27109401dc0020cc9acca9ccd62a4a3a2416cc8e55\
+1e21ccf96c52ccf51761ccc30755ccb82dccedccb3cca53e62cc8d665accafdc00202029787a6acc83594eccd576cccdcc\
+c442cce3756dccb5151ecc8339ccae5dccc4ccff57cce5ccc51e4fcc88ccbbcd27109402dc002034744012cce0ccaccca0\
+29ccaf4e62cc955dccacccf76809ccce17712c275343ccaa49280f750756cca9dc00201bcc94cceb2251cce62d1636ccf0\
+ccec52cc88ccbaccab5248ccfa71ccca5bcc802fcced10ccc230ccf3cc9acce10fccabcd2710c0";
+
+    /// Real wire bytes of the legacy `DataMapLevel::First(DataMap)` form,
+    /// produced by `self_encryption` 0.30.0 + `rmp_serde`. Ground truth.
+    const REAL_DATAMAP_OLD: &str = "81a54669727374939400dc002015cc95cc9accb9ccf655cc934d66ccf6cc912e\
+ccb15e153847ccbcccd4cca90bcc94cce549520dcc8e51cce8cccdccf2ccc8dc0020372077ccac20022ccc94ccbcccce5d\
+0dcce3ccc8ccdd6149cce1ccd5ccc5ccdccc93cc934fccac2725671365673bcd27109401dc0020cc9acca9ccd62a4a3a24\
+16cc8e551e21ccf96c52ccf51761ccc30755ccb82dccedccb3cca53e62cc8d665accafdc00202029787a6acc83594eccd5\
+76cccdccc442cce3756dccb5151ecc8339ccae5dccc4ccff57cce5ccc51e4fcc88ccbbcd27109402dc002034744012cce0\
+ccaccca029ccaf4e62cc955dccacccf76809ccce17712c275343ccaa49280f750756cca9dc00201bcc94cceb2251cce62d\
+1636ccf0ccec52cc88ccbaccab5248ccfa71ccca5bcc802fcced10ccc230ccf3cc9acce10fccabcd2710";
 
     /// Threshold that never triggers the size shortcut in these small tests.
     const NO_SHORTCUT: u64 = u64::MAX;
 
     #[test]
-    fn detects_real_datamap_root() {
-        let bytes = encode_datamap(&[(0, 1000), (1, 1_048_576), (2, 512)], None);
+    fn detects_real_datamap_current_format() {
+        let bytes = hex::decode(REAL_DATAMAP_NEW).unwrap();
         assert_eq!(parse_datamap(&bytes), Some(3));
         assert_eq!(classify(&bytes, NO_SHORTCUT).class, ContentClass::DataMap);
     }
 
     #[test]
-    fn detects_datamap_with_child() {
-        let bytes = encode_datamap(&[(0, 100), (1, 200)], Some(1));
-        assert_eq!(parse_datamap(&bytes), Some(2));
+    fn detects_real_datamap_legacy_format() {
+        let bytes = hex::decode(REAL_DATAMAP_OLD).unwrap();
+        assert_eq!(parse_datamap(&bytes), Some(3));
+        assert_eq!(classify(&bytes, NO_SHORTCUT).class, ContentClass::DataMap);
     }
 
     #[test]
     fn rejects_datamap_impostors() {
-        // Right length but wrong version byte.
-        let mut bytes = encode_datamap(&[(0, 100), (1, 200)], None);
-        bytes[0] = 0x02;
+        // A truncated DataMap must not parse.
+        let bytes = hex::decode(REAL_DATAMAP_NEW).unwrap();
+        assert_eq!(parse_datamap(&bytes[..bytes.len() - 40]), None);
+
+        // Flipping the version byte (offset 1) breaks the current-format check.
+        let mut bytes = hex::decode(REAL_DATAMAP_NEW).unwrap();
+        bytes[1] = 0x02;
         assert_eq!(parse_datamap(&bytes), None);
 
-        // Right length, wrong index sequence.
-        let mut bytes = encode_datamap(&[(0, 100), (1, 200)], None);
-        bytes[1 + 8] = 5; // first index = 5 instead of 0
-        assert_eq!(parse_datamap(&bytes), None);
-
-        // src_size out of range (huge) — like random data would have.
-        let bytes = encode_datamap(&[(0, u64::MAX)], None);
-        assert_eq!(parse_datamap(&bytes), None);
-
-        // Random bytes essentially never parse.
-        let random: Vec<u8> = (0..250u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        // Random bytes essentially never deserialize into the nested shape.
+        let random: Vec<u8> = (0..300u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
         assert_eq!(parse_datamap(&random), None);
+
+        // Plaintext is not a DataMap.
+        assert_eq!(parse_datamap(&b"hello world, this is not a datamap".repeat(4)), None);
     }
 
     #[test]

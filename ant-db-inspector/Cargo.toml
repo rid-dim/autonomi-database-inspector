@@ -12,6 +12,9 @@ hex.workspace = true
 clap.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Autonomi serializes public DataMaps with rmp-serde (MessagePack); we use the
+# same crate to deserialize candidate chunks back into mirror structs.
+rmp-serde = "1"
 page_size = "0.6"
 
 [dev-dependencies]

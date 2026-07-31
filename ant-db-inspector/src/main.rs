@@ -647,14 +647,27 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
 }
 
 fn histogram(sizes: &[u64]) -> Vec<HistogramBucket> {
-    const BOUNDS: [(u64, &str); 7] = [
-        (1024, "< 1 KiB"),
-        (4 * 1024, "1–4 KiB"),
-        (16 * 1024, "4–16 KiB"),
-        (64 * 1024, "16–64 KiB"),
-        (256 * 1024, "64–256 KiB"),
-        (1024 * 1024, "256 KiB–1 MiB"),
-        (4 * 1024 * 1024, "1–4 MiB"),
+    // 4 MiB is a legal chunk size (ant-protocol MAX_CHUNK_SIZE), so the top
+    // bounded bucket is upper-inclusive; the overflow bucket only catches
+    // protocol violations.
+    const MAX_CHUNK: u64 = 4 * 1024 * 1024;
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * 1024;
+    const BOUNDS: [(u64, &str); 14] = [
+        (KIB, "< 1 KiB"),
+        (2 * KIB, "1–2 KiB"),
+        (4 * KIB, "2–4 KiB"),
+        (8 * KIB, "4–8 KiB"),
+        (16 * KIB, "8–16 KiB"),
+        (32 * KIB, "16–32 KiB"),
+        (64 * KIB, "32–64 KiB"),
+        (128 * KIB, "64–128 KiB"),
+        (256 * KIB, "128–256 KiB"),
+        (512 * KIB, "256–512 KiB"),
+        (MIB, "512 KiB–1 MiB"),
+        (2 * MIB, "1–2 MiB"),
+        (3 * MIB, "2–3 MiB"),
+        (4 * MIB, "3–4 MiB"),
     ];
     let mut buckets: Vec<HistogramBucket> = BOUNDS
         .iter()
@@ -665,16 +678,21 @@ fn histogram(sizes: &[u64]) -> Vec<HistogramBucket> {
         })
         .collect();
     buckets.push(HistogramBucket {
-        label: "≥ 4 MiB".to_string(),
+        label: "> 4 MiB".to_string(),
         upper_bound_bytes: None,
         count: 0,
     });
 
     for &s in sizes {
-        let idx = BOUNDS
-            .iter()
-            .position(|(ub, _)| s < *ub)
-            .unwrap_or(BOUNDS.len());
+        let idx = if s > MAX_CHUNK {
+            BOUNDS.len()
+        } else {
+            // s == 4 MiB finds no smaller bound and lands in "3–4 MiB".
+            BOUNDS
+                .iter()
+                .position(|(ub, _)| s < *ub)
+                .unwrap_or(BOUNDS.len() - 1)
+        };
         buckets[idx].count += 1;
     }
     buckets
@@ -997,10 +1015,16 @@ mod tests {
 
     #[test]
     fn histogram_buckets_cover_all_sizes() {
-        let sizes = [10, 2048, 5000, 20_000, 100_000, 500_000, 2_000_000, 4_194_304, 8_000_000];
+        let sizes = [10, 2048, 5000, 20_000, 100_000, 300_000, 600_000, 2_000_000, 4_194_304, 8_000_000];
         let h = histogram(&sizes);
         assert_eq!(h.iter().map(|b| b.count).sum::<u64>(), sizes.len() as u64);
-        assert_eq!(h.last().unwrap().count, 2); // 4 MiB and 8 MB in the open bucket
+
+        let count_of = |label: &str| h.iter().find(|b| b.label == label).unwrap().count;
+        assert_eq!(count_of("256–512 KiB"), 1); // 300_000
+        assert_eq!(count_of("512 KiB–1 MiB"), 1); // 600_000
+        // Exactly MAX_CHUNK_SIZE is legal and must not land in the overflow bucket.
+        assert_eq!(count_of("3–4 MiB"), 1); // 4_194_304
+        assert_eq!(count_of("> 4 MiB"), 1); // 8_000_000 (protocol violation)
     }
 
     #[test]

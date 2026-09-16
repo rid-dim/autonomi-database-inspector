@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "scheme": "suffix-hex",
+  "shard_chars": 2,
+  "depth": 1,
+  "name_encoding": "lower-hex"
+}

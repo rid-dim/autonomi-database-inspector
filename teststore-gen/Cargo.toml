@@ -1,0 +1,15 @@
+[package]
+name = "teststore-gen"
+version = "0.2.0"
+description = "Generate a test chunk store in the ant-node file layout, with real self-encrypted files and public DataMaps"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+self_encryption.workspace = true
+xor_name.workspace = true
+rmp-serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+hex.workspace = true
+clap.workspace = true

@@ -151,6 +151,39 @@ $ ant-inspect dm.chunk --addresses | while read a; do ant chunk get "$a" -o "chu
 $ ant-inspect dm.chunk --store chunks --decrypt out.bin      # for a shrunk map, repeat with --resolve --addresses first
 ```
 
+## Repairing a store
+
+There is no index file to repair. The node rebuilds its key set from the
+directory names under `chunks/` at every start (ADR-0014: "the filesystem is
+the sole authority"), so a chunk is "known" exactly when it sits at
+`chunks/<xy>/<address>` as a regular file with a 64-character lowercase hex
+name whose last two characters equal the shard directory. Anything else on
+disk is skipped by the node's scan. `ant-inspect <node>` lists those cases
+under "other entries":
+
+| Finding | What the node does | Fix |
+|---|---|---|
+| in-flight temp file `.tmp.*` | deletes it at next start | nothing |
+| `*.not-a-chunk` | quarantined earlier (a case-folded twin of a real name) | delete, or rename to the correct lowercase name if the content is good |
+| uppercase-named file | ignored (would be quarantined) | rename to lowercase |
+| chunk file in the wrong shard directory | ignored ("Move it or delete it") | move to `chunks/<last two hex>/` |
+| foreign / non-regular file, file directly in `chunks/` | ignored | remove or move |
+| content does not hash to the name (`--verify`) | detected on read, quarantined, re-fetched from peers | delete the file; replication restores it |
+
+Files added while the node runs are not indexed until it restarts. Recipe:
+
+```console
+$ ant-inspect /path/to/node --verify            # lists every problem and exits 2 on bad content
+$ addr=$(ant-inspect "$f" --json | jq -r .address)          # true address of a stray file
+$ mv "$f" "/path/to/node/chunks/${addr: -2}/$addr"          # put it where the node looks
+$ ant-inspect /path/to/node --locate "$addr"                # confirm
+# then restart the node
+```
+
+The paid list (`paid_list.mdb`) is independent of all this: it gates which
+replicas the node *accepts*, not which chunks it serves, and it rebuilds
+itself by majority confirmation from the paid close group.
+
 ## Content classification
 
 A node's chunk store holds opaque bytes; the only rule is

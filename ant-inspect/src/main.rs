@@ -19,13 +19,14 @@ mod store;
 use classify::{classify, Classification, ContentClass};
 use clap::{Parser, ValueEnum};
 use datamap::{ChunkRow, DataMapStats, ParsedDataMap, WireFormat};
-use self_encryption::DataMap;
+use self_encryption::{ChunkInfo, DataMap};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use store::{Scan, TargetKind};
+use std::process::Command;
+use store::{ChunkEntry, Scan, TargetKind};
 use xor_name::XorName;
 
 const EXIT_OK: u8 = 0;
@@ -116,6 +117,26 @@ struct Args {
     #[arg(long, value_name = "FILE")]
     decrypt: Option<PathBuf>,
 
+    /// Fetch chunks that are not available locally from the network with the
+    /// `ant` CLI (`ant chunk get`) into --fetch-dir and use them. Applies to
+    /// every DataMap level touched (with --resolve / --decrypt).
+    #[arg(long)]
+    fetch: bool,
+
+    /// Where --fetch puts downloaded chunks (flat, one file per address).
+    /// Chunks already there are reused.
+    #[arg(long, value_name = "DIR", default_value = "./fetched-chunks")]
+    fetch_dir: PathBuf,
+
+    /// The ant CLI binary used by --fetch
+    #[arg(long, value_name = "PATH", default_value = "ant")]
+    ant_bin: String,
+
+    /// Extra arguments for the ant CLI, placed before the subcommand, e.g.
+    /// "-b 1.2.3.4:10000,5.6.7.8:10000" (one string, split on whitespace)
+    #[arg(long, value_name = "ARGS", allow_hyphen_values = true)]
+    ant_args: Option<String>,
+
     /// Exit 0 if PATH is a DataMap, 3 otherwise. Prints nothing.
     #[arg(long)]
     is_datamap: bool,
@@ -158,7 +179,105 @@ struct FileReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     resolve_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    fetch_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     decrypted: Option<DecryptReport>,
+}
+
+/// Where chunks may come from: the store the file lives in (or --store),
+/// plus the --fetch-dir once it exists.
+#[derive(Default)]
+struct Sources {
+    scans: Vec<Scan>,
+    /// Index of the fetch-dir scan in `scans`, if present.
+    fetch_index: Option<usize>,
+}
+
+impl Sources {
+    fn locate(&self, address: &XorName) -> Option<(&Scan, &ChunkEntry)> {
+        self.scans.iter().find_map(|s| s.locate(address).map(|e| (s, e)))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.scans.is_empty()
+    }
+
+    fn describe(&self) -> String {
+        self.scans.iter().map(|s| s.chunks_dir.display().to_string()).collect::<Vec<_>>().join(", ")
+    }
+
+    fn set_fetch_dir(&mut self, scan: Scan) {
+        match self.fetch_index {
+            Some(i) => self.scans[i] = scan,
+            None => {
+                self.scans.push(scan);
+                self.fetch_index = Some(self.scans.len() - 1);
+            }
+        }
+    }
+}
+
+/// Downloads missing chunks with the `ant` CLI.
+struct Fetcher {
+    bin: String,
+    args: Vec<String>,
+    dir: PathBuf,
+}
+
+impl Fetcher {
+    fn from_args(args: &Args) -> Option<Fetcher> {
+        args.fetch.then(|| Fetcher {
+            bin: args.ant_bin.clone(),
+            args: args.ant_args.as_deref().unwrap_or("").split_whitespace().map(str::to_string).collect(),
+            dir: args.fetch_dir.clone(),
+        })
+    }
+
+    /// Fetch every chunk of `infos` that no source holds, then rescan the
+    /// fetch directory into `sources`. Returns how many were fetched.
+    fn ensure(&self, infos: &[ChunkInfo], sources: &mut Sources) -> Result<usize, String> {
+        let missing: Vec<XorName> = infos
+            .iter()
+            .map(|c| c.dst_hash)
+            .filter(|a| sources.locate(a).is_none())
+            .collect();
+        if missing.is_empty() {
+            return Ok(0);
+        }
+        std::fs::create_dir_all(&self.dir).map_err(|e| format!("{}: {e}", self.dir.display()))?;
+        let mut failed = Vec::new();
+        let mut fetched = 0;
+        for (i, addr) in missing.iter().enumerate() {
+            let hex = hex::encode(addr);
+            let out_path = self.dir.join(&hex);
+            eprintln!("fetching {}/{} {hex} …", i + 1, missing.len());
+            let output = Command::new(&self.bin)
+                .args(&self.args)
+                .args(["chunk", "get", &hex, "-o"])
+                .arg(&out_path)
+                .output()
+                .map_err(|e| format!("cannot run `{}`: {e} (install the ant CLI or pass --ant-bin)", self.bin))?;
+            let good = output.status.success() && out_path.is_file()
+                && std::fs::read(&out_path).map(|b| blake3::hash(&b).as_bytes() == &addr.0).unwrap_or(false);
+            if good {
+                fetched += 1;
+            } else {
+                let _ = std::fs::remove_file(&out_path);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let reason = stderr.lines().last().unwrap_or("no output").trim().to_string();
+                failed.push(format!("{hex}: {reason}"));
+            }
+        }
+        if fetched > 0 {
+            let scan = Scan::scan(&self.dir).map_err(|e| format!("{}: {e}", self.dir.display()))?;
+            sources.set_fetch_dir(scan);
+        }
+        if failed.is_empty() {
+            Ok(fetched)
+        } else {
+            Err(format!("{} of {} chunk(s) could not be fetched: {}", failed.len(), missing.len(), failed.join("; ")))
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -215,8 +334,8 @@ struct StoreReport {
     layout_error: Option<String>,
     layout_is_current: Option<bool>,
     lock_present: bool,
-    shards_present: usize,
-    shard_fill: Option<ShardFill>,
+    /// Directory structure as actually found (inferred from the files).
+    structure: store::Structure,
     chunk_count: usize,
     total_bytes: u64,
     allocated_bytes: Option<u64>,
@@ -235,15 +354,6 @@ struct StoreReport {
     verification: Option<VerifyReport>,
     records: Option<Vec<RecordReport>>,
     records_truncated_at: Option<usize>,
-}
-
-#[derive(Serialize)]
-struct ShardFill {
-    min: u64,
-    max: u64,
-    mean: f64,
-    /// Shards (of 256) that hold at least one chunk.
-    non_empty: usize,
 }
 
 /// How the stored addresses spread over the XOR space. A node's holdings
@@ -341,11 +451,16 @@ fn run(args: &Args) -> Result<u8, String> {
     let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
 
     if meta.is_file() {
-        let store_scan = match &args.store {
-            Some(dir) => Some(scan_dir(dir)?),
-            None => find_store_for_file(path).map(|d| scan_dir(&d)).transpose()?,
+        let mut sources = Sources::default();
+        let store_dir = match &args.store {
+            Some(dir) => Some(dir.clone()),
+            None => find_store_for_file(path),
         };
-        return inspect_file(args, path, store_scan);
+        if let Some(dir) = store_dir {
+            sources.scans.push(scan_dir(&dir)?);
+        }
+        add_fetch_dir(args, &mut sources)?;
+        return inspect_file(args, path, sources);
     }
     if !meta.is_dir() {
         return Err(format!("{}: neither a file nor a directory", path.display()));
@@ -358,12 +473,12 @@ fn run(args: &Args) -> Result<u8, String> {
         scan.resolve_addresses().map_err(|e| e.to_string())?;
         return Ok(match scan.locate(&addr) {
             Some(entry) => {
-                println!("{}", entry.path.display());
+                println!("{}", scan.path_of(entry).display());
                 EXIT_OK
             }
             None => {
                 if !args.quiet {
-                    eprintln!("not found: {} (expected at {})", hex::encode(addr), scan.expected_path(&addr).display());
+                    eprintln!("{}", not_found_message(&scan, &addr));
                 }
                 EXIT_NOT_FOUND
             }
@@ -374,49 +489,68 @@ fn run(args: &Args) -> Result<u8, String> {
         let addr = store::parse_address(addr)?;
         scan.resolve_addresses().map_err(|e| e.to_string())?;
         let Some(entry) = scan.locate(&addr) else {
-            eprintln!("not found: {} (expected at {})", hex::encode(addr), scan.expected_path(&addr).display());
+            eprintln!("{}", not_found_message(&scan, &addr));
             return Ok(EXIT_NOT_FOUND);
         };
-        let file = entry.path.clone();
-        return inspect_file(args, &file, Some(scan));
+        let file = scan.path_of(entry);
+        let mut sources = Sources { scans: vec![scan], fetch_index: None };
+        add_fetch_dir(args, &mut sources)?;
+        return inspect_file(args, &file, sources);
     }
 
     inspect_store(args, scan)
+}
+
+/// With --fetch, chunks downloaded by an earlier run are picked up again.
+fn add_fetch_dir(args: &Args, sources: &mut Sources) -> Result<(), String> {
+    if args.fetch && args.fetch_dir.is_dir() {
+        sources.set_fetch_dir(scan_dir(&args.fetch_dir)?);
+    }
+    Ok(())
+}
+
+fn not_found_message(scan: &Scan, addr: &XorName) -> String {
+    match scan.expected_path(addr) {
+        Some(p) => format!("not found: {} (the node would look at {})", hex::encode(addr), p.display()),
+        None => format!("not found: {}", hex::encode(addr)),
+    }
 }
 
 fn scan_dir(dir: &Path) -> Result<Scan, String> {
     Scan::scan(dir).map_err(|e| format!("{}: {e}", dir.display()))
 }
 
-/// For a file inside a store (`…/chunks/<xy>/<addr>`, `…/chunks/<addr>` or any
-/// directory of chunk files), find the store directory to check against.
+/// For a file inside a store, find the directory to check its DataMap
+/// chunks against: the nearest ancestor that is a node root or has
+/// `layout.json`, else the top of the hex-named shard directories the file
+/// sits in, else its own directory when that holds other chunk files.
 fn find_store_for_file(file: &Path) -> Option<PathBuf> {
     let abs = std::fs::canonicalize(file).ok()?;
-    let mut dir = abs.parent()?;
-    for _ in 0..3 {
-        let kind = store::detect_kind(dir);
-        match kind {
-            TargetKind::ChunkStore | TargetKind::NodeRoot => return Some(dir.to_path_buf()),
-            TargetKind::ShardDir => {}
-            TargetKind::GenericDir => {}
+    let parent = abs.parent()?;
+    // 1. A real store above us (up to a few levels).
+    let mut dir = parent;
+    for _ in 0..4 {
+        if store::detect_kind(dir).is_store() {
+            return Some(dir.to_path_buf());
         }
         dir = dir.parent()?;
     }
-    // Not inside a recognizable store: fall back to the file's own directory
-    // when it holds other chunk-named files (a dump directory).
-    let parent = abs.parent()?;
-    if store::detect_kind(parent) == TargetKind::ShardDir {
-        return Some(parent.to_path_buf());
+    // 2. Climb out of shard-named directories (prefix or suffix sharding of
+    //    any depth) to the directory that holds the whole structure.
+    let mut top = parent;
+    while store::looks_like_shard_dir(top) {
+        top = top.parent()?;
     }
-    let has_siblings = std::fs::read_dir(parent).ok()?.flatten().any(|e| {
-        e.path() != abs && e.file_name().to_str().is_some_and(|n| store::decode_chunk_name(n).is_some())
-    });
-    has_siblings.then(|| parent.to_path_buf())
+    if top != parent {
+        return Some(top.to_path_buf());
+    }
+    // 3. A flat dump directory.
+    store::has_chunk_files(parent).then(|| parent.to_path_buf())
 }
 
 // ───────────────────────────── single file ─────────────────────────────
 
-fn inspect_file(args: &Args, path: &Path, mut store_scan: Option<Scan>) -> Result<u8, String> {
+fn inspect_file(args: &Args, path: &Path, mut sources: Sources) -> Result<u8, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let address = XorName(*blake3::hash(&bytes).as_bytes());
     let name_address = path
@@ -442,6 +576,7 @@ fn inspect_file(args: &Args, path: &Path, mut store_scan: Option<Scan>) -> Resul
         datamap: None,
         resolved: Vec::new(),
         resolve_error: None,
+        fetch_error: None,
         decrypted: None,
     };
 
@@ -461,16 +596,36 @@ fn inspect_file(args: &Args, path: &Path, mut store_scan: Option<Scan>) -> Resul
 
     let mut levels: Vec<ParsedDataMap> = vec![parsed];
     let want_resolve = args.resolve || args.decrypt.is_some();
+    for scan in &mut sources.scans {
+        scan.resolve_addresses().map_err(|e| e.to_string())?;
+    }
+    let fetcher = Fetcher::from_args(args);
+    if let Some(f) = &fetcher {
+        if let Err(e) = f.ensure(levels[0].infos(), &mut sources) {
+            report.fetch_error = Some(e);
+        }
+    }
     if want_resolve {
-        match &mut store_scan {
-            Some(scan) => loop {
+        if sources.is_empty() {
+            report.resolve_error = Some(
+                "no local chunks known (file is not inside a chunk directory; pass --store DIR, or --fetch)".to_string(),
+            );
+        } else {
+            loop {
                 let current = levels.last().unwrap();
                 if !current.is_child() {
                     break;
                 }
-                match decrypt_level(&current.data_map, scan) {
+                match decrypt_level(&current.data_map, &sources) {
                     Ok(parent_bytes) => match datamap::parse(&parent_bytes) {
-                        Some(parent) => levels.push(parent),
+                        Some(parent) => {
+                            if let Some(f) = &fetcher {
+                                if let Err(e) = f.ensure(parent.infos(), &mut sources) {
+                                    report.fetch_error = Some(e);
+                                }
+                            }
+                            levels.push(parent);
+                        }
                         None => {
                             report.resolve_error =
                                 Some("decrypted parent level is not a valid DataMap".to_string());
@@ -482,18 +637,13 @@ fn inspect_file(args: &Args, path: &Path, mut store_scan: Option<Scan>) -> Resul
                         break;
                     }
                 }
-            },
-            None => {
-                report.resolve_error = Some(
-                    "no local chunk store known (file is not inside a store; pass --store DIR)".to_string(),
-                );
             }
         }
     }
 
     let mut reports: Vec<DataMapReport> = levels
         .iter()
-        .map(|p| datamap_report(p, store_scan.as_mut()))
+        .map(|p| datamap_report(p, &sources))
         .collect();
     report.datamap = Some(reports.remove(0));
     report.resolved = reports;
@@ -503,8 +653,10 @@ fn inspect_file(args: &Args, path: &Path, mut store_scan: Option<Scan>) -> Resul
         if root.is_child() {
             report.resolve_error.get_or_insert_with(|| "could not reach the root DataMap".to_string());
         } else {
-            let scan = store_scan.as_mut().ok_or("no local chunk store known for --decrypt")?;
-            let plain = decrypt_content(&root.data_map, scan)?;
+            if sources.is_empty() {
+                return Err("no local chunks known for --decrypt (pass --store DIR or --fetch)".into());
+            }
+            let plain = decrypt_content(&root.data_map, &sources)?;
             std::fs::write(out, &plain).map_err(|e| format!("{}: {e}", out.display()))?;
             report.decrypted = Some(DecryptReport {
                 output: out.display().to_string(),
@@ -541,6 +693,10 @@ fn inspect_file(args: &Args, path: &Path, mut store_scan: Option<Scan>) -> Resul
             };
             print_datamap_section(lvl, &title, args);
         }
+        if let Some(e) = &report.fetch_error {
+            println!();
+            println!("Fetch: FAILED — {e}");
+        }
         if let Some(e) = &report.resolve_error {
             println!();
             println!("Resolve: FAILED — {e}");
@@ -556,7 +712,7 @@ fn inspect_file(args: &Args, path: &Path, mut store_scan: Option<Scan>) -> Resul
     Ok(if report.resolve_error.is_some() { EXIT_NOT_FOUND } else { EXIT_OK })
 }
 
-fn datamap_report(parsed: &ParsedDataMap, scan: Option<&mut Scan>) -> DataMapReport {
+fn datamap_report(parsed: &ParsedDataMap, sources: &Sources) -> DataMapReport {
     let network_bytes = datamap::to_network_bytes(&parsed.data_map);
     let rows = parsed.rows();
     let mut chunks: Vec<ChunkRowLocal> = rows
@@ -564,13 +720,12 @@ fn datamap_report(parsed: &ParsedDataMap, scan: Option<&mut Scan>) -> DataMapRep
         .map(|row| ChunkRowLocal { row, local: None, local_size: None })
         .collect();
     let mut local = None;
-    if let Some(scan) = scan {
-        let _ = scan.resolve_addresses();
+    if !sources.is_empty() {
         let mut present = 0;
         let mut present_bytes = 0;
         for (info, c) in parsed.infos().iter().zip(chunks.iter_mut()) {
-            match scan.locate(&info.dst_hash) {
-                Some(entry) => {
+            match sources.locate(&info.dst_hash) {
+                Some((_, entry)) => {
                     c.local = Some(true);
                     c.local_size = Some(entry.size);
                     present += 1;
@@ -580,7 +735,7 @@ fn datamap_report(parsed: &ParsedDataMap, scan: Option<&mut Scan>) -> DataMapRep
             }
         }
         local = Some(CoverageReport {
-            store: scan.chunks_dir.display().to_string(),
+            store: sources.describe(),
             present,
             total: chunks.len(),
             present_bytes,
@@ -601,30 +756,31 @@ fn datamap_report(parsed: &ParsedDataMap, scan: Option<&mut Scan>) -> DataMapRep
 /// Decrypt one shrink level: read the child map's chunks from the local
 /// store, decrypt each with self_encryption and concatenate — the result is
 /// the bincode-serialized parent DataMap.
-fn decrypt_level(dm: &DataMap, scan: &mut Scan) -> Result<Vec<u8>, String> {
+fn decrypt_level(dm: &DataMap, sources: &Sources) -> Result<Vec<u8>, String> {
     let level = dm.child().ok_or("not a child DataMap")?;
-    decrypt_chunks(dm, level, scan)
+    decrypt_chunks(dm, level, sources)
 }
 
 /// Decrypt the file content described by a root DataMap from local chunks.
-fn decrypt_content(dm: &DataMap, scan: &mut Scan) -> Result<Vec<u8>, String> {
+fn decrypt_content(dm: &DataMap, sources: &Sources) -> Result<Vec<u8>, String> {
     if dm.is_child() {
         return Err("not a root DataMap".into());
     }
-    decrypt_chunks(dm, 0, scan)
+    decrypt_chunks(dm, 0, sources)
 }
 
-fn decrypt_chunks(dm: &DataMap, level: usize, scan: &mut Scan) -> Result<Vec<u8>, String> {
+fn decrypt_chunks(dm: &DataMap, level: usize, sources: &Sources) -> Result<Vec<u8>, String> {
     let src_hashes: Vec<XorName> = dm.infos().iter().map(|c| c.src_hash).collect();
     let mut out = Vec::with_capacity(dm.original_file_size());
     for info in dm.infos() {
         let addr = hex::encode(info.dst_hash);
-        let entry = scan
+        let (scan, entry) = sources
             .locate(&info.dst_hash)
-            .ok_or_else(|| format!("chunk {} of {} ({addr}) is not in the local store", info.index, dm.len()))?;
-        let bytes = entry.read().map_err(|e| format!("{}: {e}", entry.path.display()))?;
+            .ok_or_else(|| format!("chunk {} of {} ({addr}) is not available locally (try --store DIR or --fetch)", info.index, dm.len()))?;
+        let path = scan.path_of(entry);
+        let bytes = scan.read(entry).map_err(|e| format!("{}: {e}", path.display()))?;
         if blake3::hash(&bytes).as_bytes() != &info.dst_hash.0 {
-            return Err(format!("{}: content does not hash to its address", entry.path.display()));
+            return Err(format!("{}: content does not hash to its address", path.display()));
         }
         let plain = self_encryption::decrypt_chunk(info.index, &bytes.into(), &src_hashes, level)
             .map_err(|e| format!("chunk {} ({addr}): decryption failed: {e}", info.index))?;
@@ -745,7 +901,7 @@ fn print_datamap_rows(m: &DataMapReport, args: &Args) {
 
 fn inspect_store(args: &Args, mut scan: Scan) -> Result<u8, String> {
     let need_content = args.verify || args.classify || args.datamaps;
-    if scan.kind == TargetKind::GenericDir || args.addresses || args.list {
+    if scan.kind == TargetKind::Directory || args.addresses || args.list {
         scan.resolve_addresses().map_err(|e| e.to_string())?;
     }
 
@@ -767,21 +923,11 @@ fn inspect_store(args: &Args, mut scan: Scan) -> Result<u8, String> {
         None => (None, None, None),
     };
 
-    let is_store = matches!(scan.kind, TargetKind::NodeRoot | TargetKind::ChunkStore);
-    let shard_fill = is_store.then(|| {
-        let non_empty = scan.per_shard.iter().filter(|&&c| c > 0).count();
-        ShardFill {
-            min: scan.per_shard.iter().copied().min().unwrap_or(0),
-            max: scan.per_shard.iter().copied().max().unwrap_or(0),
-            mean: scan.chunks.len() as f64 / store::SHARD_COUNT as f64,
-            non_empty,
-        }
-    });
-
     // Per-chunk content pass (classification, DataMap discovery, verification).
     let mut classifications: Vec<Option<Classification>> = vec![None; scan.chunks.len()];
     let mut datamap_hits: Vec<(usize, ParsedDataMap)> = Vec::new();
     let mut verify = args.verify.then(|| VerifyReport { checked: 0, ok: 0, failed: 0, unreadable: 0, failures: Vec::new() });
+    let mut read_errors: Vec<String> = Vec::new();
     if need_content {
         let assume = if args.assume_encrypted_above == 0 { u64::MAX } else { args.assume_encrypted_above };
         #[allow(clippy::needless_range_loop)]
@@ -792,13 +938,13 @@ fn inspect_store(args: &Args, mut scan: Scan) -> Result<u8, String> {
             if !want_read {
                 continue;
             }
-            let bytes = match entry.read() {
+            let bytes = match scan.read(entry) {
                 Ok(b) => b,
                 Err(e) => {
                     if let Some(v) = &mut verify {
                         v.unreadable += 1;
                     }
-                    scan.errors.push(format!("{}: {e}", entry.path.display()));
+                    read_errors.push(format!("{}: {e}", scan.path_of(entry).display()));
                     continue;
                 }
             };
@@ -812,7 +958,7 @@ fn inspect_store(args: &Args, mut scan: Scan) -> Result<u8, String> {
                         v.failed += 1;
                         if v.failures.len() < 20 {
                             v.failures.push(VerifyFailure {
-                                path: entry.path.display().to_string(),
+                                path: scan.path_of(entry).display().to_string(),
                                 expected: hex::encode(expected),
                                 computed: hex::encode(computed),
                             });
@@ -867,7 +1013,7 @@ fn inspect_store(args: &Args, mut scan: Scan) -> Result<u8, String> {
             let entry = &scan.chunks[*i];
             list.push(DataMapSummary {
                 address: entry.address().map(hex::encode).unwrap_or_default(),
-                path: entry.path.display().to_string(),
+                path: scan.path_of(entry).display().to_string(),
                 format: p.format,
                 child: p.child(),
                 chunk_count: p.infos().len(),
@@ -892,7 +1038,7 @@ fn inspect_store(args: &Args, mut scan: Scan) -> Result<u8, String> {
                 RecordReport {
                     address: e.address().map(hex::encode).unwrap_or_default(),
                     size_bytes: e.size,
-                    path: e.path.display().to_string(),
+                    path: scan.path_of(e).display().to_string(),
                     classification: classifications[i].clone(),
                 }
             })
@@ -911,8 +1057,7 @@ fn inspect_store(args: &Args, mut scan: Scan) -> Result<u8, String> {
         layout_error,
         layout_is_current,
         lock_present: scan.lock_present,
-        shards_present: scan.shards_present,
-        shard_fill,
+        structure: scan.structure.clone(),
         chunk_count: scan.chunks.len(),
         total_bytes: scan.total_bytes(),
         allocated_bytes: scan.allocated_bytes(),
@@ -921,7 +1066,7 @@ fn inspect_store(args: &Args, mut scan: Scan) -> Result<u8, String> {
         quarantined: paths_to_strings(&scan.quarantined, LIST_CAP),
         misfiled: paths_to_strings(&scan.misfiled, LIST_CAP),
         unexpected: paths_to_strings(&scan.unexpected, LIST_CAP),
-        errors: scan.errors.clone(),
+        errors: scan.errors.iter().cloned().chain(read_errors).collect(),
         address_spread,
         node: scan.node.clone(),
         statistics,
@@ -1065,14 +1210,30 @@ fn print_store_report(r: &StoreReport, args: &Args) {
         (None, Some(e)) => println!("  layout.json   : UNREADABLE — {e}"),
         (None, None) => println!("  layout.json   : absent"),
     }
-    if matches!(r.kind, TargetKind::NodeRoot | TargetKind::ChunkStore) {
+    if r.kind.is_store() {
         println!("  lock file     : {}", if r.lock_present { "present (.lock)" } else { "absent" });
-        if let Some(f) = &r.shard_fill {
-            println!(
-                "  shards        : {} of 256 directories present, {} non-empty; files per shard min {} / max {} / mean {:.2}",
-                r.shards_present, f.non_empty, f.min, f.max, f.mean
-            );
+    }
+    let st = &r.structure;
+    let scheme = match st.scheme.as_str() {
+        "flat" => "flat (files directly in the directory)".to_string(),
+        "prefix-hex" => format!("sharded on the FIRST {} hex chars of the address", st.shard_chars),
+        "suffix-hex" => format!("sharded on the LAST {} hex chars of the address", st.shard_chars),
+        "empty" => "no chunk files".to_string(),
+        _ => "no single scheme (mixed / unrecognized)".to_string(),
+    };
+    let depth = if st.depth_min == st.depth_max { format!("depth {}", st.depth_min) } else { format!("depth {}–{}", st.depth_min, st.depth_max) };
+    println!("  structure     : {scheme}; {depth}; {} directories with chunks", fmt_num(st.dirs_with_chunks as u64));
+    if st.dirs_with_chunks > 0 {
+        let mut line = format!(
+            "  files per dir : min {} / max {} / mean {:.1}",
+            fmt_num(st.files_per_dir_min),
+            fmt_num(st.files_per_dir_max),
+            st.files_per_dir_mean
+        );
+        if st.off_scheme > 0 {
+            line.push_str(&format!("; {} file(s) outside the {} scheme", fmt_num(st.off_scheme as u64), st.scheme));
         }
+        println!("{line}");
     }
     println!("  chunk files   : {}", fmt_num(r.chunk_count as u64));
     println!("  total size    : {}", fmt_bytes(r.total_bytes));
@@ -1087,7 +1248,7 @@ fn print_store_report(r: &StoreReport, args: &Args) {
         other.push(format!("{} quarantined (*.not-a-chunk)", r.quarantined.len()));
     }
     if !r.misfiled.is_empty() {
-        other.push(format!("{} chunk file(s) in the WRONG shard directory (the node ignores them)", r.misfiled.len()));
+        other.push(format!("{} chunk file(s) NOT at chunks/<last two hex>/<address> — the node ignores them", r.misfiled.len()));
     }
     if !r.unexpected.is_empty() {
         other.push(format!("{} unexpected entr(ies)", r.unexpected.len()));

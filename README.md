@@ -89,10 +89,20 @@ whole input consumed), so a positive is trustworthy.
 ant-inspect <PATH> [OPTIONS]
 ```
 
-`PATH` is auto-detected as a node root (has `chunks/`), a chunk store (has
-`layout.json` or `<xy>/` shards), a single shard directory, any other
-directory (scanned recursively, every regular file is a chunk candidate), or a
-file.
+`PATH` is auto-detected:
+
+- **node root** (has `chunks/`) or **chunk store** (has `layout.json`):
+  *store mode* — ant-node's rules apply, and anything the node would not
+  index (wrong shard, uppercase name, temp/quarantined entries) is flagged.
+- **any other directory**: *directory mode* — walked recursively, every
+  regular file is a chunk candidate, whatever the structure (flat, sharded on
+  the first or last N hex characters, nested deeper). Nothing is judged; the
+  structure actually found is reported. Use this for your own chunk
+  collections and for stores with a different layout.
+- **a file**: chunk / DataMap / `.datamap`. For its chunks the tool looks in
+  the store or directory the file lives in (it climbs out of hex-named shard
+  directories to the top of the structure), or in `--store DIR`, and can pull
+  missing ones from the network with `--fetch`.
 
 | Option | Effect |
 |---|---|
@@ -108,7 +118,9 @@ file.
 | `--assume-encrypted-above BYTES` | with `--classify`, skip scanning payloads at least this large (default 3.5 MiB; 0 = scan all) |
 | `--chunk ADDR` | inspect one chunk of the store by address |
 | `--locate ADDR` | print the file path for an address (exit 3 if absent) |
-| `-s`, `--store DIR` | store to check a DataMap's chunks against / resolve from (default: the store the file lives in) |
+| `-s`, `--store DIR` | store or directory to look for a DataMap's chunks in (default: the one the file lives in) |
+| `--fetch` | download chunks not found locally with the `ant` CLI (`ant chunk get`) into `--fetch-dir` (default `./fetched-chunks`) and use them; applies to every level with `--resolve`/`--decrypt`. Already-fetched chunks are reused |
+| `--ant-bin PATH`, `--ant-args "…"` | the ant binary for `--fetch` and extra arguments placed before the subcommand, e.g. `--ant-args "-b 1.2.3.4:10000"` |
 | `-r`, `--resolve` | shrunk DataMap: decrypt the parent level(s) from local chunks down to the root DataMap |
 | `--decrypt FILE` | reconstruct the file from local chunks (all must be present) and write it to FILE; every chunk's plaintext is checked against `src_hash` |
 | `--is-datamap` | exit 0 if the file is a DataMap, 3 otherwise; prints nothing |
@@ -145,10 +157,14 @@ $ ant-inspect /path/to/node --verify -q || echo "corrupt chunk files!"
 # Where is chunk X? cat its bytes
 $ cat "$(ant-inspect /path/to/node --locate "$addr")" | xxd | head
 
-# Pull a public file's chunks with the ant CLI and rebuild the file offline
+# Rebuild a public file from a DataMap: fetch whatever is missing via the ant CLI
 $ ant chunk get "$addr" -o dm.chunk
-$ ant-inspect dm.chunk --addresses | while read a; do ant chunk get "$a" -o "chunks/$a"; done
-$ ant-inspect dm.chunk --store chunks --decrypt out.bin      # for a shrunk map, repeat with --resolve --addresses first
+$ ant-inspect dm.chunk --fetch --decrypt out.bin             # resolves shrunk levels, fetches, decrypts, verifies
+$ ant-inspect dm.chunk --fetch --ant-args "-b 1.2.3.4:10000" --resolve --addresses   # explicit bootstrap peers
+
+# A DataMap in a store with a different layout (e.g. sharded on the first 3 hex chars)
+$ ant-inspect /big/store/abc/abc123…  --resolve              # the store is found automatically
+$ ant-inspect some.datamap --store /big/store --list -q      # or name it
 ```
 
 ## Repairing a store
@@ -318,9 +334,15 @@ $ ant-inspect testdata --chunk <shrunk-datamap-address> --decrypt file4.bin   # 
 
 ## Notes
 
-- Scanning stats every chunk file (name + size); that is fast even for
-  hundreds of thousands of files. `--verify`, `--classify` and `--datamaps`
-  read file contents and scale with the store size.
+- Scanning stats every chunk file (name + size), in parallel across
+  subdirectories, keeping ~80 bytes per chunk in memory; millions of files
+  are fine. A progress line appears on stderr for big stores. `--verify`,
+  `--classify` and `--datamaps` read file contents and scale with the store
+  size.
+- `--fetch` shells out to the `ant` CLI (WithAutonomi/ant-client). It needs
+  bootstrap peers: put `bootstrap_peers.toml` from the release next to the
+  binary or pass `--ant-args "-b ip:port,…"`. Downloads land in
+  `--fetch-dir`, never in a node's store.
 - Reading a store while the node runs is safe: the node treats the filesystem
   as the sole authority and only ever creates temp files, renames them into
   place and unlinks. A chunk that appears or vanishes mid-scan is simply

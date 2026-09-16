@@ -158,6 +158,9 @@ pub struct Scan {
     pub chunks: Vec<ChunkEntry>,
     pub temp_files: Vec<PathBuf>,
     pub quarantined: Vec<PathBuf>,
+    /// Chunk-named files lying in the wrong shard directory. The node ignores
+    /// them: its read path only looks under the shard named by the address.
+    pub misfiled: Vec<PathBuf>,
     /// Entries that are neither chunk files nor known store artifacts.
     pub unexpected: Vec<PathBuf>,
     /// Directories that could not be read (permissions etc.).
@@ -190,6 +193,7 @@ impl Scan {
             chunks: Vec::new(),
             temp_files: Vec::new(),
             quarantined: Vec::new(),
+            misfiled: Vec::new(),
             unexpected: Vec::new(),
             errors: Vec::new(),
             node: None,
@@ -279,6 +283,10 @@ impl Scan {
             };
             if !meta.is_file() {
                 self.unexpected.push(entry.path());
+                continue;
+            }
+            if addr[31] != shard {
+                self.misfiled.push(entry.path());
                 continue;
             }
             self.per_shard[shard as usize] += 1;
@@ -575,6 +583,10 @@ mod tests {
         });
         fs::write(chunks.join("ab").join("junk.not-a-chunk"), b"x").unwrap();
         fs::write(chunks.join("ab").join("notes.txt"), b"x").unwrap();
+        // A real chunk name in the wrong shard: the node cannot find it.
+        let misfiled = XorName(*blake3::hash(b"misfiled").as_bytes());
+        assert_ne!(misfiled[31], 0xab);
+        fs::write(chunks.join("ab").join(hex::encode(misfiled)), b"misfiled").unwrap();
         fs::write(root.join("migration-state.json"), r#"{"schema":1,"phase":"files_only"}"#).unwrap();
         fs::create_dir_all(root.join("paid_list.mdb")).unwrap();
         fs::write(root.join("paid_list.mdb").join("data.mdb"), vec![0u8; 1000]).unwrap();
@@ -587,6 +599,8 @@ mod tests {
         assert_eq!(scan.temp_files.len(), 1);
         assert_eq!(scan.quarantined.len(), 1);
         assert_eq!(scan.unexpected.len(), 1);
+        assert_eq!(scan.misfiled.len(), 1);
+        assert!(scan.locate(&misfiled).is_none());
         assert!(scan.locate(&a).is_some());
         assert!(scan.locate(&b).is_some());
         assert!(scan.locate(&XorName([9u8; 32])).is_none());

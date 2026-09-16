@@ -102,6 +102,7 @@ file.
 | `--sort addr\|size`, `--limit N` | order / cap for lists |
 | `-q`, `--quiet` | no report, only the requested list |
 | `--verify` | recompute BLAKE3 of every chunk file and compare with its name; exit 2 on mismatch |
+| *(always)* | flags entries the node would not index: in-flight temp files, quarantined `*.not-a-chunk`, uppercase names, chunk files in the wrong shard directory, foreign files |
 | `-c`, `--classify` | classify every chunk (datamap / encrypted / media / text / binary) and print the distribution |
 | `-d`, `--datamaps` | find every public DataMap in the store; per map: level, chunk count, content size, how many of its chunks are local |
 | `--assume-encrypted-above BYTES` | with `--classify`, skip scanning payloads at least this large (default 3.5 MiB; 0 = scan all) |

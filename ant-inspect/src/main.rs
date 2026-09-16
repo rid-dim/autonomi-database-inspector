@@ -223,6 +223,8 @@ struct StoreReport {
     uppercase_names: usize,
     temp_files: Vec<String>,
     quarantined: Vec<String>,
+    /// Chunk-named files in the wrong shard directory (invisible to the node).
+    misfiled: Vec<String>,
     unexpected: Vec<String>,
     errors: Vec<String>,
     address_spread: Option<AddressSpread>,
@@ -917,6 +919,7 @@ fn inspect_store(args: &Args, mut scan: Scan) -> Result<u8, String> {
         uppercase_names: scan.chunks.iter().filter(|c| c.uppercase_name).count(),
         temp_files: paths_to_strings(&scan.temp_files, LIST_CAP),
         quarantined: paths_to_strings(&scan.quarantined, LIST_CAP),
+        misfiled: paths_to_strings(&scan.misfiled, LIST_CAP),
         unexpected: paths_to_strings(&scan.unexpected, LIST_CAP),
         errors: scan.errors.clone(),
         address_spread,
@@ -1083,6 +1086,9 @@ fn print_store_report(r: &StoreReport, args: &Args) {
     if !r.quarantined.is_empty() {
         other.push(format!("{} quarantined (*.not-a-chunk)", r.quarantined.len()));
     }
+    if !r.misfiled.is_empty() {
+        other.push(format!("{} chunk file(s) in the WRONG shard directory (the node ignores them)", r.misfiled.len()));
+    }
     if !r.unexpected.is_empty() {
         other.push(format!("{} unexpected entr(ies)", r.unexpected.len()));
     }
@@ -1090,7 +1096,7 @@ fn print_store_report(r: &StoreReport, args: &Args) {
         other.push(format!("{} uppercase-named file(s) the node would ignore", r.uppercase_names));
     }
     println!("  other entries : {}", if other.is_empty() { "none".to_string() } else { other.join(", ") });
-    for p in r.temp_files.iter().chain(r.quarantined.iter()).chain(r.unexpected.iter()).take(20) {
+    for p in r.temp_files.iter().chain(r.quarantined.iter()).chain(r.misfiled.iter()).chain(r.unexpected.iter()).take(20) {
         println!("                  {p}");
     }
     for e in &r.errors {

@@ -111,7 +111,8 @@ ant-inspect <PATH> [OPTIONS]
 | `-a`, `--addresses` | bare addresses, one per line. DataMap: its chunk addresses in order (exit 3 if not a DataMap). Store: all chunk addresses |
 | `--sort addr\|size`, `--limit N` | order / cap for lists |
 | `-q`, `--quiet` | no report, only the requested list |
-| `--verify` | recompute BLAKE3 of every chunk file and compare with its name; exit 2 on mismatch |
+| `--verify` | recompute BLAKE3 of every chunk file and compare with its name; exit 2 on mismatch. Reads everything: budget for the store's full size |
+| `-j`, `--jobs N` | parallel readers for `--verify` / `--classify` / `--datamaps` (default: CPUs, max 8). Raise on NAS/network storage, lower on a single spinning disk |
 | *(always)* | flags entries the node would not index: in-flight temp files, quarantined `*.not-a-chunk`, uppercase names, chunk files in the wrong shard directory, foreign files |
 | `-c`, `--classify` | classify every chunk (datamap / encrypted / media / text / binary) and print the distribution |
 | `-d`, `--datamaps` | find every public DataMap in the store; per map: level, chunk count, content size, how many of its chunks are local |
@@ -336,9 +337,12 @@ $ ant-inspect testdata --chunk <shrunk-datamap-address> --decrypt file4.bin   # 
 
 - Scanning stats every chunk file (name + size), in parallel across
   subdirectories, keeping ~80 bytes per chunk in memory; millions of files
-  are fine. A progress line appears on stderr for big stores. `--verify`,
-  `--classify` and `--datamaps` read file contents and scale with the store
-  size.
+  are fine. `--verify`, `--classify` and `--datamaps` then read every file
+  with `--jobs` parallel readers, which takes as long as reading the whole
+  store takes (a 3 TB store over a 1 Gbit/s NAS link is many hours). Both
+  phases show a progress line with throughput and ETA on stderr when it is a
+  terminal; the report itself is printed at the end, so redirecting stdout
+  to a file is fine.
 - `--fetch` shells out to the `ant` CLI (WithAutonomi/ant-client). It needs
   bootstrap peers: put `bootstrap_peers.toml` from the release next to the
   binary or pass `--ant-args "-b ip:port,…"`. Downloads land in

@@ -137,6 +137,12 @@ struct Args {
     #[arg(long, value_name = "ARGS", allow_hyphen_values = true)]
     ant_args: Option<String>,
 
+    /// Parallel readers for --verify / --classify / --datamaps (default: CPU
+    /// count, at most 8). Raise it on network storage, lower it on a single
+    /// spinning disk.
+    #[arg(long, short = 'j', value_name = "N")]
+    jobs: Option<usize>,
+
     /// Exit 0 if PATH is a DataMap, 3 otherwise. Prints nothing.
     #[arg(long)]
     is_datamap: bool,
@@ -924,61 +930,101 @@ fn inspect_store(args: &Args, mut scan: Scan) -> Result<u8, String> {
     };
 
     // Per-chunk content pass (classification, DataMap discovery, verification).
+    // Files are read by a pool of workers; results are merged in index order
+    // so the report is deterministic whatever the thread timing.
     let mut classifications: Vec<Option<Classification>> = vec![None; scan.chunks.len()];
     let mut datamap_hits: Vec<(usize, ParsedDataMap)> = Vec::new();
     let mut verify = args.verify.then(|| VerifyReport { checked: 0, ok: 0, failed: 0, unreadable: 0, failures: Vec::new() });
     let mut read_errors: Vec<String> = Vec::new();
     if need_content {
         let assume = if args.assume_encrypted_above == 0 { u64::MAX } else { args.assume_encrypted_above };
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..scan.chunks.len() {
-            let entry = &scan.chunks[i];
-            let small_enough = entry.size as usize <= datamap::MAX_PARSE_LEN;
-            let want_read = args.verify || args.classify || (args.datamaps && small_enough);
-            if !want_read {
-                continue;
-            }
-            let bytes = match scan.read(entry) {
-                Ok(b) => b,
-                Err(e) => {
-                    if let Some(v) = &mut verify {
-                        v.unreadable += 1;
-                    }
-                    read_errors.push(format!("{}: {e}", scan.path_of(entry).display()));
-                    continue;
-                }
-            };
-            if let Some(v) = &mut verify {
-                if let Some(expected) = entry.name_address {
-                    let computed = XorName(*blake3::hash(&bytes).as_bytes());
-                    v.checked += 1;
-                    if computed == expected {
-                        v.ok += 1;
-                    } else {
-                        v.failed += 1;
-                        if v.failures.len() < 20 {
-                            v.failures.push(VerifyFailure {
-                                path: scan.path_of(entry).display().to_string(),
-                                expected: hex::encode(expected),
-                                computed: hex::encode(computed),
-                            });
+        let todo: Vec<usize> = (0..scan.chunks.len())
+            .filter(|&i| {
+                let small_enough = scan.chunks[i].size as usize <= datamap::MAX_PARSE_LEN;
+                args.verify || args.classify || (args.datamaps && small_enough)
+            })
+            .collect();
+        let total_bytes: u64 = todo.iter().map(|&i| scan.chunks[i].size).sum();
+        let what = if args.verify { "verifying" } else { "reading" };
+        let progress = ContentProgress::new(what, todo.len(), total_bytes);
+        let jobs = args
+            .jobs
+            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8))
+            .max(1);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let outcomes: std::sync::Mutex<Vec<ContentOutcome>> = std::sync::Mutex::new(Vec::with_capacity(todo.len()));
+        let scan_ref = &scan;
+        std::thread::scope(|sc| {
+            for _ in 0..jobs {
+                sc.spawn(|| {
+                    let mut local = Vec::new();
+                    loop {
+                        let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(&i) = todo.get(k) else { break };
+                        let entry = &scan_ref.chunks[i];
+                        let mut out = ContentOutcome { index: i, computed: None, classification: None, datamap: None, error: None };
+                        match scan_ref.read(entry) {
+                            Ok(bytes) => {
+                                if args.verify && entry.name_address.is_some() {
+                                    out.computed = Some(XorName(*blake3::hash(&bytes).as_bytes()));
+                                }
+                                if args.classify {
+                                    let c = classify(&bytes, assume);
+                                    if c.class == ContentClass::DataMap && args.datamaps {
+                                        out.datamap = datamap::parse(&bytes);
+                                    }
+                                    out.classification = Some(c);
+                                } else if args.datamaps && bytes.len() <= datamap::MAX_PARSE_LEN {
+                                    out.datamap = datamap::parse(&bytes);
+                                }
+                                progress.tick(bytes.len() as u64);
+                            }
+                            Err(e) => {
+                                out.error = Some(format!("{}: {e}", scan_ref.path_of(entry).display()));
+                                progress.tick(0);
+                            }
+                        }
+                        local.push(out);
+                        if local.len() >= 1024 {
+                            outcomes.lock().unwrap().append(&mut local);
                         }
                     }
-                }
+                    outcomes.lock().unwrap().append(&mut local);
+                });
             }
-            if args.classify {
-                let c = classify(&bytes, assume);
-                if c.class == ContentClass::DataMap && args.datamaps {
-                    if let Some(p) = datamap::parse(&bytes) {
-                        datamap_hits.push((i, p));
+        });
+        progress.finish();
+
+        let mut outcomes = outcomes.into_inner().unwrap();
+        outcomes.sort_by_key(|o| o.index);
+        for out in outcomes {
+            let i = out.index;
+            if let Some(e) = out.error {
+                if let Some(v) = &mut verify {
+                    v.unreadable += 1;
+                }
+                read_errors.push(e);
+                continue;
+            }
+            if let (Some(v), Some(computed), Some(expected)) = (&mut verify, out.computed, scan.chunks[i].name_address) {
+                v.checked += 1;
+                if computed == expected {
+                    v.ok += 1;
+                } else {
+                    v.failed += 1;
+                    if v.failures.len() < 20 {
+                        v.failures.push(VerifyFailure {
+                            path: scan.path_of(&scan.chunks[i]).display().to_string(),
+                            expected: hex::encode(expected),
+                            computed: hex::encode(computed),
+                        });
                     }
                 }
-                classifications[i] = Some(c);
-            } else if args.datamaps && small_enough {
-                if let Some(p) = datamap::parse(&bytes) {
-                    datamap_hits.push((i, p));
-                }
             }
+            if let Some(p) = out.datamap {
+                datamap_hits.push((i, p));
+            }
+            classifications[i] = out.classification;
         }
     }
 
@@ -1399,6 +1445,90 @@ fn print_record_rows(recs: &[RecordReport]) {
             line.push_str(c.class.key());
         }
         let _ = writeln!(out, "{line}");
+    }
+}
+
+/// What one worker found out about one chunk file.
+struct ContentOutcome {
+    index: usize,
+    computed: Option<XorName>,
+    classification: Option<Classification>,
+    datamap: Option<ParsedDataMap>,
+    error: Option<String>,
+}
+
+/// Progress line on stderr for the content pass (only when stderr is a
+/// terminal), refreshed at most twice a second.
+struct ContentProgress {
+    what: &'static str,
+    total_files: usize,
+    total_bytes: u64,
+    files: std::sync::atomic::AtomicUsize,
+    bytes: std::sync::atomic::AtomicU64,
+    started: std::time::Instant,
+    last: std::sync::Mutex<std::time::Instant>,
+    enabled: bool,
+    printed: std::sync::atomic::AtomicBool,
+}
+
+impl ContentProgress {
+    fn new(what: &'static str, total_files: usize, total_bytes: u64) -> Self {
+        use std::io::IsTerminal;
+        let now = std::time::Instant::now();
+        ContentProgress {
+            what,
+            total_files,
+            total_bytes,
+            files: std::sync::atomic::AtomicUsize::new(0),
+            bytes: std::sync::atomic::AtomicU64::new(0),
+            started: now,
+            last: std::sync::Mutex::new(now),
+            enabled: io::stderr().is_terminal() && total_files > 0,
+            printed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn tick(&self, bytes: u64) {
+        use std::sync::atomic::Ordering;
+        let files = self.files.fetch_add(1, Ordering::Relaxed) + 1;
+        let done = self.bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        if !self.enabled {
+            return;
+        }
+        let Ok(mut last) = self.last.try_lock() else { return };
+        if last.elapsed().as_millis() < 500 && files < self.total_files {
+            return;
+        }
+        *last = std::time::Instant::now();
+        let secs = self.started.elapsed().as_secs_f64().max(0.001);
+        let rate = done as f64 / secs;
+        let eta = if rate > 0.0 && self.total_bytes > done {
+            let s = ((self.total_bytes - done) as f64 / rate) as u64;
+            format!(", ~{}m{:02}s left", s / 60, s % 60)
+        } else {
+            String::new()
+        };
+        let msg = format!(
+            "\r{}… {} / {} files, {} of {} read ({}/s{eta})   ",
+            self.what,
+            fmt_num(files as u64),
+            fmt_num(self.total_files as u64),
+            fmt_short(done),
+            fmt_short(self.total_bytes),
+            fmt_short(rate as u64),
+        );
+        let mut e = io::stderr().lock();
+        let _ = e.write_all(msg.as_bytes());
+        let _ = e.flush();
+        self.printed.store(true, Ordering::Relaxed);
+    }
+
+    fn finish(&self) {
+        if self.printed.load(std::sync::atomic::Ordering::Relaxed) {
+            let mut e = io::stderr().lock();
+            let _ = write!(e, "\r{}\r", " ".repeat(100));
+            let _ = e.flush();
+        }
     }
 }
 

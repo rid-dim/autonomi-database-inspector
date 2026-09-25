@@ -185,6 +185,7 @@ under "other entries":
 | uppercase-named file | ignored (would be quarantined) | rename to lowercase |
 | chunk file in the wrong shard directory | ignored ("Move it or delete it") | move to `chunks/<last two hex>/` |
 | foreign / non-regular file, file directly in `chunks/` | ignored | remove or move |
+| empty 0-byte file with a chunk name | indexed by name, fails on read, quarantined, re-fetched | delete the file (an interrupted write); replication restores it |
 | content does not hash to the name (`--verify`) | detected on read, quarantined, re-fetched from peers | delete the file; replication restores it |
 
 Files added while the node runs are not indexed until it restarts. Recipe:

@@ -346,6 +346,9 @@ struct StoreReport {
     total_bytes: u64,
     allocated_bytes: Option<u64>,
     uppercase_names: usize,
+    /// 0-byte files with chunk names: interrupted writes, never valid.
+    empty_files: Vec<String>,
+    empty_file_count: usize,
     temp_files: Vec<String>,
     quarantined: Vec<String>,
     /// Chunk-named files in the wrong shard directory (invisible to the node).
@@ -419,6 +422,8 @@ struct VerifyReport {
     checked: u64,
     ok: u64,
     failed: u64,
+    /// Failures that are 0-byte files (a subset of `failed`).
+    empty: u64,
     unreadable: u64,
     failures: Vec<VerifyFailure>,
 }
@@ -428,6 +433,9 @@ struct VerifyFailure {
     path: String,
     expected: String,
     computed: String,
+    /// Set for failures with an obvious cause, e.g. "empty file (0 bytes)".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -808,6 +816,9 @@ fn decrypt_chunks(dm: &DataMap, level: usize, sources: &Sources) -> Result<Vec<u
 
 fn print_file_header(r: &FileReport) {
     println!("File       : {}  ({})", r.path, fmt_bytes(r.size_bytes));
+    if r.size_bytes == 0 {
+        println!("WARNING    : EMPTY FILE (0 bytes) — an interrupted or failed write; it can never be a valid chunk");
+    }
     let name_note = match r.name_matches {
         Some(true) => "  — matches filename",
         Some(false) => "  — DOES NOT MATCH filename",
@@ -934,7 +945,7 @@ fn inspect_store(args: &Args, mut scan: Scan) -> Result<u8, String> {
     // so the report is deterministic whatever the thread timing.
     let mut classifications: Vec<Option<Classification>> = vec![None; scan.chunks.len()];
     let mut datamap_hits: Vec<(usize, ParsedDataMap)> = Vec::new();
-    let mut verify = args.verify.then(|| VerifyReport { checked: 0, ok: 0, failed: 0, unreadable: 0, failures: Vec::new() });
+    let mut verify = args.verify.then(|| VerifyReport { checked: 0, ok: 0, failed: 0, empty: 0, unreadable: 0, failures: Vec::new() });
     let mut read_errors: Vec<String> = Vec::new();
     if need_content {
         let assume = if args.assume_encrypted_above == 0 { u64::MAX } else { args.assume_encrypted_above };
@@ -1012,11 +1023,16 @@ fn inspect_store(args: &Args, mut scan: Scan) -> Result<u8, String> {
                     v.ok += 1;
                 } else {
                     v.failed += 1;
-                    if v.failures.len() < 20 {
+                    let empty = scan.chunks[i].size == 0;
+                    if empty {
+                        v.empty += 1;
+                    }
+                    if v.failures.len() < 20 || empty && v.failures.len() < 40 {
                         v.failures.push(VerifyFailure {
                             path: scan.path_of(&scan.chunks[i]).display().to_string(),
                             expected: hex::encode(expected),
                             computed: hex::encode(computed),
+                            note: empty.then(|| "empty file (0 bytes) — an interrupted or failed write, never a valid chunk".to_string()),
                         });
                     }
                 }
@@ -1108,6 +1124,14 @@ fn inspect_store(args: &Args, mut scan: Scan) -> Result<u8, String> {
         total_bytes: scan.total_bytes(),
         allocated_bytes: scan.allocated_bytes(),
         uppercase_names: scan.chunks.iter().filter(|c| c.uppercase_name).count(),
+        empty_files: scan
+            .chunks
+            .iter()
+            .filter(|c| c.size == 0)
+            .take(LIST_CAP)
+            .map(|c| scan.path_of(c).display().to_string())
+            .collect(),
+        empty_file_count: scan.chunks.iter().filter(|c| c.size == 0).count(),
         temp_files: paths_to_strings(&scan.temp_files, LIST_CAP),
         quarantined: paths_to_strings(&scan.quarantined, LIST_CAP),
         misfiled: paths_to_strings(&scan.misfiled, LIST_CAP),
@@ -1302,8 +1326,14 @@ fn print_store_report(r: &StoreReport, args: &Args) {
     if r.uppercase_names > 0 {
         other.push(format!("{} uppercase-named file(s) the node would ignore", r.uppercase_names));
     }
+    if r.empty_file_count > 0 {
+        other.push(format!(
+            "{} EMPTY (0-byte) file(s) — interrupted writes, never valid chunks",
+            r.empty_file_count
+        ));
+    }
     println!("  other entries : {}", if other.is_empty() { "none".to_string() } else { other.join(", ") });
-    for p in r.temp_files.iter().chain(r.quarantined.iter()).chain(r.misfiled.iter()).chain(r.unexpected.iter()).take(20) {
+    for p in r.empty_files.iter().chain(r.temp_files.iter()).chain(r.quarantined.iter()).chain(r.misfiled.iter()).chain(r.unexpected.iter()).take(20) {
         println!("                  {p}");
     }
     for e in &r.errors {
@@ -1412,10 +1442,18 @@ fn print_store_report(r: &StoreReport, args: &Args) {
     if let Some(v) = &r.verification {
         println!();
         println!("Verification (BLAKE3(content) == filename)");
-        println!("  checked: {}   ok: {}   failed: {}   unreadable: {}", v.checked, v.ok, v.failed, v.unreadable);
+        println!(
+            "  checked: {}   ok: {}   failed: {} (of which {} empty 0-byte files)   unreadable: {}",
+            v.checked, v.ok, v.failed, v.empty, v.unreadable
+        );
         for f in &v.failures {
-            println!("  FAIL {}", f.path);
-            println!("       expected {}  computed {}", f.expected, f.computed);
+            match &f.note {
+                Some(note) => println!("  FAIL {}  — {note}", f.path),
+                None => {
+                    println!("  FAIL {}", f.path);
+                    println!("       expected {}  computed {}", f.expected, f.computed);
+                }
+            }
         }
     }
 
